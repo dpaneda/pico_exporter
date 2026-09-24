@@ -1,0 +1,22 @@
+# Example unit. Copy to /etc/systemd/system/, adjust, then:
+#   systemctl daemon-reload && systemctl enable --now pico_exporter
+#
+# Recommended: keep GW_PASS out of this file and in the EnvironmentFile below
+# with mode 0600. Anything set with Environment= here is printed by
+# `systemctl cat` and `systemctl show`, token included.
+
+[Unit]
+Description=pico_exporter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/pico_exporter
+Environment=GW_URL=https://otlp-gateway-prod/otlp/v1/metrics
+Environment=GW_USER=12345
+EnvironmentFile=/etc/pico_exporter.env
+Restart=always
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target

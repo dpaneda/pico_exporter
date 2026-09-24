@@ -1,0 +1,43 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build gcc-aarch64-linux-gnu
+
+      - name: Cache build dependencies
+        uses: actions/cache@v4
+        with:
+          path: build/deps
+          key: pico-deps-${{ hashFiles('tools/bearssl_env.sh', 'tools/deps.sh') }}
+
+      - name: Build binaries (x86_64 + aarch64)
+        run: make aarch64
+
+      - name: Stage release assets
+        run: |
+          mkdir -p release-assets
+          cp bin/pico_exporter release-assets/pico_exporter-x86_64
+          cp bin/pico_exporter-picolibc-aarch64 release-assets/pico_exporter-aarch64
+          (cd release-assets && sha256sum pico_exporter-x86_64 pico_exporter-aarch64 > pico_exporter-SHA256SUMS.txt)
+
+      - name: Create release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release-assets/* \
+            --title "$GITHUB_REF_NAME" --generate-notes

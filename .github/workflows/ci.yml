@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build gcc-aarch64-linux-gnu
+
+      - name: Cache build dependencies
+        uses: actions/cache@v4
+        with:
+          path: build/deps
+          key: pico-deps-${{ hashFiles('tools/bearssl_env.sh', 'tools/deps.sh') }}
+
+      - name: Preflight check
+        run: make doctor
+
+      - name: Build binaries (x86_64 + aarch64)
+        run: make aarch64
+
+      - name: Upload built binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: pico_exporter-binaries
+          path: |
+            bin/pico_exporter
+            bin/pico_exporter-picolibc-aarch64
+
+      - name: Run full test gate
+        run: make test

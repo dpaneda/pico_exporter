@@ -1,0 +1,15 @@
+bin/
+build/
+*.o
+*.a
+*.log
+tests/.fake/
+tests/.M.txt
+tests/.sink*.bin
+tests/.sink*.bin.conns
+tests/.push*.log
+tests/.metrics.log
+compile_commands.json
+*.d
+tests/.fake_big/
+tests/.capped.log
