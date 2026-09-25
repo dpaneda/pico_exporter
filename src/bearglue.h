@@ -1,8 +1,9 @@
 #ifndef BEARGLUE_H
 #define BEARGLUE_H
 
-/* bearglue.c exported API: static-storage BearSSL TLS client. Contexts live in
-   .bss, one client per process, reused across push cycles. */
+/* bearglue.c exported API: heap-free BearSSL TLS client. Contexts live in
+   two anonymous page mappings (session: kept across cycles; handshake: dropped
+   at idle), one client per process, reused across push cycles. */
 
 #include <stddef.h>
 #include <stdint.h>
@@ -20,13 +21,13 @@
    BG_ERR_TOO_LARGE, and bg_grow_iobuf() recovers by moving to a full-size
    buffer, so the small default stays safe against any server.
 
-   2048 rather than 4096 saves 2 kB of resident .bss. Verified against the
+   2048 rather than 4096 saves 2 kB of the session mapping (resident across the sleep). Verified against the
    production endpoint (otlp-gateway-prod-us-central-0.grafana.net) and the
    harness one (prometheus-us-central1.grafana.net): both complete the
    handshake -- RSA chain included -- inside the 2373-byte buffer, so they
    honour the extension rather than merely tolerating the request. Re-run
    `run_tests tls` against a new endpoint before trusting it there; a peer
-   that ignores the request costs a full-size heap buffer, which is worse
+   that ignores the request costs a full-size anonymous mapping, which is worse
    than not asking. */
 #ifndef BG_MAX_FRAG
 #define BG_MAX_FRAG 2048
@@ -46,6 +47,20 @@ void bg_close(void);
 int  bg_last_error(void);   /* br_ssl_engine_last_error */
 int  bg_iobuf_size(void);   /* current I/O buffer size */
 int  bg_grow_iobuf(void);   /* 1 if it grew: retry the handshake */
+
+/* The handshake-only state (X.509 engine context) lives in its own anonymous
+   mapping so idle_sleep() can evict it between cycles: br_x509_minimal_init
+   rewrites the whole context before every handshake and BearSSL only calls
+   into it during one. NULL/0 until the first handshake mapped it. Plain
+   globals rather than an accessor because idle_sleep() must not call into text
+   it is about to evict; only bearglue.c writes them. */
+extern unsigned char *bg_hs_base;
+extern size_t         bg_hs_len;
+
+/* Session-id length of the current engine session, -1 before the first
+   handshake. Exists only for `run_tests resume`; nothing in the service calls
+   it, so LTO/--gc-sections drop it from that binary. */
+int bg_session_id_len(void);
 
 /* Replaces the default trust-anchor set for subsequent handshakes (the
    compile-in anchors are the default until this is called). `tas` must live

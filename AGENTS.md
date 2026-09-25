@@ -11,8 +11,11 @@ Pi. Every 15 s it reads `/proc` + `/sys` + `statvfs`, builds an
 `ExportMetricsServiceRequest` protobuf, and POSTs it to a Grafana Cloud OTLP
 gateway over TLS. Two hard constraints drive every design decision:
 
-1. **Footprint is the goal.** Target ≈ 140 kB steady RSS on the Pi.
-   No libc `malloc` on the hot cycle path, everything in `.bss`/arena.
+1. **Footprint is the goal.** Resting RSS (between cycles, `smaps_rollup`) is
+   28 kB on the Pi (20-32 kB on x86) — see "Memory & footprint". No `malloc` unless the arena is
+   exhausted (never in production), plus `popen` in the SYSTEMD=1 build:
+   per-cycle data goes to the arena, everything else to `.bss`, the TLS
+   session mapping, or a mapping `idle_sleep` drops.
 2. **Everything must self-bootstrap.** A fresh clone needs only host base tools
    + network once; BearSSL, picolibc and meson are fetched (sha256-pinned) and
    built into the gitignored `build/deps/`.
@@ -36,8 +39,11 @@ src/otlp.[ch]         OTLP protobuf encoder (dry-run sizing + backpatching),
 src/push.[ch]         URL parse, Basic auth, TCP connect, HTTP/1.1 request +
                       response drain, keep-alive across batches
 src/dns.c             minimal RFC-1035 A-record resolver (UDP, /etc/resolv.conf)
-src/bearglue.[ch]     static-storage BearSSL client (.bss contexts, one suite)
+src/bearglue.[ch]     BearSSL client, session/handshake anon page mappings, one suite
 src/arena.[ch]        mmap + madvise(MADV_DONTNEED) per-cycle arena
+src/idle.[ch]         drop-then-sleep between cycles: evicts code/rodata/handshake
+                      state/deep stack with raw madvise, then raw nanosleep
+src/pdir.[ch]         getdents64 directory iterator (no opendir, no heap)
 src/linux_sock.c      picolibc socket/network syscall shims (aarch64 + x86_64)
 srv/                  header stubs picolibc lacks: sys/socket.h, netinet/in.h,
                       sys/utsname.h, sys/sysinfo.h
@@ -143,7 +149,10 @@ steady-state builds stay no-ops.
      keep-alive connection (`rw_conn`), reopening lazily if the peer dropped it.
   3. `printf("cycle epoch_s=… samples=… blks=… payloadB=… pushed=true http=200")`.
   4. `metrics_free()` → `arena_reset()` (madvise) → `otlp_buf_reset()` →
-     sleep `INTERVAL`.
+     `idle_sleep(INTERVAL)`: evicts the TLS handshake mapping, the stack
+     below the sleeping frame, the clean `.rodata`/`.data.rel.ro` pages and
+     the whole `.text` except its own page, then `nanosleep`. All raw
+     syscalls, so no other code page is touched. See "Memory & footprint".
 
 **The connection is held across cycles, not just across the batches of one
 cycle.** A handshake per cycle was 24.5 ms of the Pi's 41 ms CPU budget, more
@@ -174,10 +183,14 @@ The environment table is in the [README](README.md). What it does not carry:
 
 One function per metric family, in a fixed order (`collect_all`); several are
 wrapped in `SCRAPE(name)` which reports `node_scrape_collector_*_seconds` /
-`_success` for each. Reads go through `read_proc()`, which **reads files to
-EOF** into a growable buffer carved from the cycle arena (4 kB to start,
-doubling; a one-off malloc in the one-shot modes, which have no arena) — fixed-size slices silently truncate, which is how a 300-
-socket `/proc/net/udp` once reported 63.
+`_success` for each. Reads go through `read_proc()`, which uses `open`/`read`
+(never stdio) and **reads files to EOF** into a growable buffer carved from
+the cycle arena (4 kB to start, doubling; a one-off malloc in the one-shot
+modes, which have no arena) — fixed-size slices silently truncate, which is
+how a 300-socket `/proc/net/udp` once reported 63. Directory listings go
+through `pdir` (`getdents64`), never `opendir`/`readdir`: picolibc's
+`fopen`/`opendir` were the only `malloc` callers, so the default build has no
+heap page at all.
 
 Output modes:
 
@@ -235,16 +248,23 @@ round-trip in the harness is the wire gate — no frozen golden fixtures.
 
 ### BearSSL glue (`src/bearglue.c`)
 
-All TLS state lives in `.bss` statics (`g_cc`, `g_xc`, `g_ioc`, `g_iobuf`),
-one client per process, reused across cycles — no per-connection heap.
+TLS state lives in two anonymous page mappings created on the first
+handshake, one client per process: the **session** pages (client context +
+record buffer, kept while the keep-alive connection lives) and the
+**handshake** page (X.509 context), which `idle_sleep` drops every cycle
+because `br_x509_minimal_init` rewrites it before each handshake and
+BearSSL, with `BR_OPT_NO_RENEGOTIATION`, only reads it during one (the
+harness `fallback` case zero-fills it mid-connection and requires the next
+request to succeed). `g_ioc`, the seed and the pointers stay in `.bss`. No
+TLS state on the heap: the oversized-record fallback buffer is an `mmap` too.
 
 - One suite: `BR_TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`; one curve:
   `br_ec_p256_m15`; RSA PKCS#1 verify for the ServerKeyExchange.
-- **RFC 6066 fragment length** (`BG_MAX_FRAG`, default 2048) sizes the `.bss`
-  I/O buffer to 2.4 kB instead of the worst-case 16.7 kB. A peer that ignores
-  the extension and sends a bigger record fails the handshake with
+- **RFC 6066 fragment length** (`BG_MAX_FRAG`, default 2048) sizes the
+  session I/O buffer to 2.4 kB instead of the worst-case 16.7 kB. A peer that
+  ignores the extension and sends a bigger record fails the handshake with
   `BG_ERR_TOO_LARGE`; `conn_open` then calls `bg_grow_iobuf()` once (moves to a
-  full-size heap buffer, kept for the process) and retries on a fresh
+  full-size anonymous mapping, kept for the process) and retries on a fresh
   connection. A cooperating peer stays at the small buffer forever.
 - **Insecure engine** (`BG_INSECURE_NO_VERIFY`): an accept-any x509 context;
   the leaf is still decoded with `br_x509_decoder` so the ServerKeyExchange
@@ -306,6 +326,13 @@ bite:
   Page faults are exact and unbatched; multiply by 4096. Poll it in a tight
   Python loop reading the already-open fd, not with `awk` per iteration --
   spawning a process per sample is slow enough to miss the window.
+- **`/proc/<pid>/smaps_rollup` is exact.** It walks the page tables instead
+  of reading the batched counters, so it is the number to quote for a
+  resting figure. `tests/run.sh` gates on it.
+- **Refaulting one file page maps its neighbours.** The kernel's fault-around
+  (16 pages) brings back up to 64 kB of a file mapping on a single
+  instruction fetch, which is why `idle_sleep` keeps its own page instead of
+  dropping it: measured 84 kB vs 4 kB resident text.
 - **Transparent hugepages inflate anonymous mappings ~20x.** With THP in
   `always` mode a ≥2 MiB anonymous mapping faults a whole 2 MiB page on first
   touch: the 4 MiB arena made a 113 kB cycle measure 2196 kB of peak RSS.
@@ -327,21 +354,55 @@ bite:
 
 ## Memory & footprint
 
-Measured on the Pi, steady state `VmRSS == VmHWM = 120 kB`, split
-`RssFile` 92 kB + `RssAnon` 28 kB. (Compare like with like: a 25 s run against
-the live gateway. The same measurement on the pre-session tree reads 144 kB
-= 100 + 44, and a long-lived process drifts a few kB either way as new code
-paths touch new stack pages.)
+Since the idle RSS drop (`idle_sleep` between cycles, session/handshake TLS
+mappings, `pdir`/no-stdio reads), resting RSS is measured with
+`smaps_rollup` while the process sleeps between cycles, on the x86_64 dev
+host:
 
-| Mapping | RSS | Reclaimable? | Contents |
+| | before | after, http sink | after, real TLS gateway |
 |---|---|---|---|
-| text | 76 kB | yes (clean file) | `.text` 75.8 kB, essentially all of it touched each cycle |
-| rodata/data | ~16 kB | yes (clean file) | `.rodata` 15.9 kB; `.eh_frame` is down to 140 B from 11 kB (see the unwind-table note in `tools/bearssl_env.sh`) |
-| `.bss` | ~12 kB | no | `g_cc` 3720 + `g_xc` 3168 + `g_iobuf` 2373 = 9.3 kB of 10.3 kB |
-| stack | ~12 kB | no | computed peak ~6.2 kB (`main` 3312 B + `collect_hwmon` 2928 B); rest is startup/argv/env |
-| heap | 4 kB | no | picolibc `sbrk` page |
+| text (r-xp) | 84 kB | 4 kB (only `idle_sleep`'s page) | 4 kB |
+| RW file mapping (rodata + dirty data page) | 20 kB | 4 kB (the dirty data page) | 4 kB |
+| `.bss` anon pages | 4 kB (http) | 0 (small `.bss` fits in the data page) | 0 |
+| TLS anon mappings | n/a | none | 8 kB (session pages; handshake page evicted) |
+| `[heap]` | 4 kB | 0 | 0 |
+| `[stack]` | 16 kB | 12 kB (env/argv + `main`/`push_loop` frames) | 12-16 kB |
+| **Rss total** | **128 kB** | **20-24 kB** | **28-32 kB** |
 
-`.text` by origin, from the linker map:
+Per cycle: 16 minor faults, measured by the `tests/run.sh` gate (fake
+rootfs, http; a real host with a bigger arena footprint faults more). Arena
+refaults are the bulk: the kernel's fault-around maps 16 pages per fault, so
+the ~21 text pages and 4 rodata pages come back in about 2-3 faults.
+
+**Pi (aarch64, TLS, live gateway), measured 2026-09-25 after two 60 s
+intervals: `smaps_rollup` Rss 28 kB, Anonymous 20 kB** (`status`: VmRSS 28,
+RssAnon 20, RssFile 8, VmHWM 132 — the HWM is the cycle peak). Per mapping:
+text 4 kB, RW file mapping 8 kB, TLS session mapping 8 kB, stack 8 kB. The
+extra RW page versus x86 is aarch64's first RW page, which holds `.eh_frame`
+plus a 4-byte writable `.except_unordered`, so `PCEIL(_pid_base)` keeps it.
+Before this work the same process read 124 kB (92 file + 32 anon).
+Procedure, run after two full intervals (`smaps_rollup` is the figure to
+quote; `status` may lag):
+
+```bash
+P=$(pidof pico_exporter)
+sudo awk '/^(Rss|Anonymous):/{print}' /proc/$P/smaps_rollup
+grep -E "VmRSS|RssAnon|RssFile" /proc/$P/status
+```
+
+| Mapping | RSS at rest | Why it stays |
+|---|---|---|
+| text | 4 kB | the page holding `idle_sleep`; the other ~20 pages refault each cycle |
+| rodata/data | 4 kB (8 on aarch64) | the dirty page: `.rodata` tail, `.data.rel.ro`, `__tls_space`, `.data`, small `.bss`; aarch64 also keeps the `.eh_frame`/`.except_unordered` page |
+| TLS session mapping | 8 kB | `br_ssl_client_context` + record buffer, alive across the keep-alive sleep |
+| stack | 8-12 kB | env/auxv page(s) plus the `main`/`push_loop` frame; deeper pages are dropped |
+| heap | 0 | no `malloc` unless the arena is exhausted (never in production), plus `popen` in the SYSTEMD=1 build |
+| TLS handshake mapping | 0 | dropped each idle, refilled on the next handshake |
+| arena | 0 | `MADV_DONTNEED` each cycle (unchanged) |
+
+`.text` by origin, from the linker map (previous measurement; text size no
+longer sets the resting footprint, only per-cycle refault cost and file
+size):
 
 | | `.text` | `.rodata` |
 |---|---|---|
@@ -351,9 +412,11 @@ paths touch new stack pages.)
 
 Rules that follow from the measurement:
 
-- **`.text` is 54% of the resting footprint and all of it is resident.** It is
-  the only large lever left at rest; the arena sets the *peak*, which is a
-  separate budget (and the one a cgroup limit sees).
+- **`.text` no longer sets the resting footprint**: it is dropped before each
+  sleep and refaulted in a handful of faults thanks to fault-around at the
+  next cycle. Its size still
+  costs per-cycle faults and file size, nothing at rest. `aligned(4096)` on
+  `idle_sleep` adds up to 4 kB of file padding per binary, never resident.
 - The I/O-buffer fallback (`bg_grow_iobuf`) is safe at runtime *because* the
   full buffer is only allocated when a peer needs it. A cipher-suite fallback
   would have to **link both implementations** — numerically the thing being
@@ -363,7 +426,16 @@ Rules that follow from the measurement:
 - Things ruled out with evidence: integer-only printf (printed `*float*` and
   corrupted every value), server-key pinning (cert rotation ⇒ outages), ECDSA
   (chain is RSA), BearSSL context trimming (needs a fork for a few hundred
-  bytes).
+  bytes), session resumption (both gateways --
+  `prometheus-us-central1.grafana.net`, the harness default, and
+  `otlp-gateway-prod-us-central-0.grafana.net`, production -- send an
+  **empty** session id in ServerHello, so there is no server-side session
+  cache to resume against; they resume only via RFC 5077 tickets, which
+  BearSSL 0.6 does not implement. Measured 2026-09-25 with
+  `run_tests resume [URL]` and confirmed with
+  `openssl s_client -tls1_2 -reconnect -no_ticket` (6/6 "New"). The harness
+  `resume` probe re-checks it and prints a NOTE if a gateway ever starts
+  issuing ids).
 - **The compiler-flag space is exhausted; measured, on the aarch64 link.**
   `-Oz` is *larger* than `-Os` (+128 B) and `-O2` much larger (+6.6 kB).
   `-fno-ident`, `-fmerge-all-constants`, `-fno-math-errno`, `-fipa-icf`,
@@ -381,6 +453,12 @@ Rules that follow from the measurement:
   `fmt_float` with an integer format saved **64 bytes**, measured. Only
   picolibc's separate integer-only variant removes it, and that is the option
   ruled out above.
+- **Anything that must survive the sleep goes to `.bss` or the session
+  mapping; anything dead at idle goes to a mapping `idle_sleep` drops.**
+  Never put live state in the handshake mapping or below `push_loop`'s
+  frame expecting it to persist: both are zero-filled by the next idle.
+  `idle_stack_floor()` must run before the first `idle_sleep()`; the drop
+  is skipped while the floor is unset.
 
 ## Testing
 
@@ -399,6 +477,11 @@ suite actually covers:
   - `tls` — live endpoint: valid chain, 405 on bare GET, stale-clock rejection;
   - `tls-bad` — wrong trust anchor must fail (62);
   - `fallback` — oversized-record recovery (`bg_test_force_too_large` seam);
+    also proves the TLS handshake mapping is dead mid-connection (zero-fills
+    it, requires the next request to still succeed);
+  - `resume [URL]` — a probe, not a pass/fail gate: reports whether the
+    gateway issues a TLS session id (it does not; see "Things ruled out"),
+    and `tests/run.sh` turns a newly issued id into a NOTE line;
   - `keepalive` — 3 POSTs on one connection vs `tests/sink.py`;
   - `encode TS NRES FIRST COUNT [k=v…]` — OTLP encode/decode round-trip using
     an **independent protobuf walker** (no golden fixtures).
@@ -406,6 +489,17 @@ suite actually covers:
   proves `pushed series == dumped samples + up`.
 - TLS cases need network; they `SKIP` cleanly when offline. The python3-based
   sink/push cases `SKIP` when `python3` is absent.
+- **Resting-footprint gate** (`tests/run.sh`, sampled while the process
+  sleeps between cycles against the http sink): `smaps_rollup` Rss <= 32 kB,
+  no `[heap]` mapping, minor faults over two cycles <= 320 — all gated on the
+  exporter still being alive (`kill -0`), so a crash fails loudly instead of
+  passing on absent files.
+- **Layout invariant** (`tests/run.sh`, before the fake-root run, on
+  `bin/pico_exporter` and, if built, the aarch64 binary): `readelf` must show
+  no relocations and no writable section other than `.data.rel.ro` inside
+  the RW range `idle_sleep` drops, `[PCEIL(.rodata), PFLOOR(min(.tls_space,
+  .data)))`, so a picolibc or linker-script change cannot silently put
+  written data under `MADV_DONTNEED`.
 
 ## Deployment
 
@@ -415,14 +509,19 @@ The one lesson worth carrying into whatever installs it — **a binary that link
 is not a binary that pushes.** Verify by waiting out a full interval and reading
 a `cycle ... pushed=true http=200` line from the log, not by checking that the
 process started; and keep the outgoing binary around so a rollback is a copy
-rather than a rebuild.
+rather than a rebuild. After deploying, take the `smaps_rollup` measurement
+in "Memory & footprint" above and update the Pi figure in this file.
 
 ## Conventions & gotchas
 
 - **No comments unless they explain a non-obvious decision** — the existing
   code comments are all such justification comments; match that tone.
-- **No libc `malloc` in the hot cycle path.** New per-cycle data goes to the
-  arena; process-lifetime state goes to `.bss` statics.
+- **No `malloc` unless the arena is exhausted (never in production), plus
+  `popen` in the SYSTEMD=1 build** (`tests/run.sh` fails on a `[heap]`
+  mapping). Per-cycle data goes to the arena; state that must
+  survive the sleep goes to `.bss` or the TLS session mapping; state dead at
+  idle goes to a mapping `idle_sleep` drops. Read `/proc`//`/sys` with
+  `open`/`read` and directories with `pdir`, never stdio/dirent.
 - **C11, `-std=c11`.** Compile every TU with identical flags: `-D_GNU_SOURCE`,
   `-D__picolibc__`, `-Isrv`, picolibc + BearSSL include dirs. Mixing them once
   produced `__isoc23_strtoll`/errno/uname mismatches between TUs.
@@ -433,6 +532,12 @@ rather than a rebuild.
   the option and needs nothing.
 - **Network byte order matters in `s_addr`** — copy the 4 RDATA bytes, do not
   shift-shift-OR.
+- **`idle_sleep` must stay a self-contained page.** No calls out (not even
+  libc), no stack protector, `aligned(4096)`; a `printf` or a helper call
+  there makes another text page resident for the whole sleep.
+  `-mstack-protector-guard=global` would otherwise add a canary check;
+  `no_stack_protector` needs GCC >= 11 (older compilers warn and keep the
+  canary, which costs nothing at rest).
 - **The Pi's `strace` is 32-bit (armhf)** and mis-decodes aarch64 syscalls —
   useless for diagnosing the deployable.
 - **Gateway debugging**: a mangled `GW_PASS` makes the gateway answer **404**,

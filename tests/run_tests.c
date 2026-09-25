@@ -7,7 +7,12 @@
  *                              GET, stale clock rejected
  *   run_tests tls-bad          same, with the wrong trust anchor (must fail
  *                              with error 62)
- *   run_tests fallback         conn_open's oversized-record recovery
+ *   run_tests fallback         conn_open's oversized-record recovery; also
+ *                              proves the handshake pages are dead once the
+ *                              connection is up
+ *   run_tests resume [URL]     probe, not a gate: reports whether the gateway
+ *                              issues a TLS session id (default: the harness
+ *                              endpoint), the evidence against resumption
  *   run_tests keepalive        3 POSTs over one connection, against tests/sink.py
  *   run_tests encode TS NRES FIRST COUNT [k=v ...]
  *                              OTLP encode/decode round-trip on stdin sample
@@ -24,11 +29,13 @@
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE 1
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/mman.h>
 
 #include "arena.h"
 #include "bearssl.h"
@@ -184,9 +191,55 @@ static int cmd_fallback(void) {
         printf("FAIL iobuf did not grow (%d -> %d)\n", before, after);
         return 1;
     }
+    if (!bg_hs_base) {
+        printf("FAIL handshake mapping not set after TLS open\n");
+        return 1;
+    }
+    if (madvise(bg_hs_base, bg_hs_len, MADV_DONTNEED) != 0) {
+        printf("FAIL madvise on the handshake mapping: %s\n", strerror(errno));
+        return 1;
+    }
+    int code = conn_push(&c, "", 0);
+    if (code <= 0) {
+        printf("FAIL request after evicting the handshake pages "
+               "(code=%d, err='%s')\n", code, c.err);
+        return 1;
+    }
+    printf("  ok   request after evicting the handshake pages (http=%d)\n",
+           code);
     conn_close(&c);
 
     printf("tls_fallback: OK (iobuf %d -> %d, reconnected)\n", before, after);
+    return 0;
+}
+
+/* --- resume: does the gateway issue a TLS session id? --------------------- */
+
+static int cmd_resume(const char *url) {
+    struct rw_url u;
+    if (!parse_rw_url(url, &u)) {
+        printf("FAIL cannot parse %s\n", url);
+        return 1;
+    }
+    struct rw_conn c;
+    conn_open(&c, &u, "", (int64_t)time(NULL), 10);
+    if (!c.open) {
+        if (strncmp(c.err, "connect:", 8) == 0) {
+            printf("tls_resume: SKIP (no network: %s)\n", c.err);
+            return 0;
+        }
+        printf("FAIL open: %s\n", c.err);
+        return 1;
+    }
+    int n = bg_session_id_len();
+    conn_close(&c);
+    printf("  %s\n", u.host);
+    if (n <= 0)
+        printf("tls_resume: NO SESSION ID (gateway issues none; resumption "
+               "cannot help; see AGENTS.md)\n");
+    else
+        printf("tls_resume: SESSION ID ISSUED (%d B) -- the gateway now caches "
+               "sessions; revisit resumption (see AGENTS.md)\n", n);
     return 0;
 }
 
@@ -684,7 +737,7 @@ static int cmd_encode(int argc, char **argv) {
 /* --- main ----------------------------------------------------------------- */
 
 static void usage(void) {
-    fprintf(stderr, "usage: run_tests <tls|tls-bad|fallback|keepalive|encode ...>\n");
+    fprintf(stderr, "usage: run_tests <tls|tls-bad|fallback|resume [URL]|keepalive|encode ...>\n");
 }
 
 int main(int argc, char **argv) {
@@ -692,6 +745,9 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "tls") == 0) return cmd_tls(0);
     if (strcmp(argv[1], "tls-bad") == 0) return cmd_tls(1);
     if (strcmp(argv[1], "fallback") == 0) return cmd_fallback();
+    if (strcmp(argv[1], "resume") == 0)
+        return cmd_resume(argc > 2 ? argv[2] :
+            "https://prometheus-us-central1.grafana.net/api/prom/push");
     if (strcmp(argv[1], "keepalive") == 0) return cmd_keepalive();
     if (strcmp(argv[1], "encode") == 0) return cmd_encode(argc, argv);
     usage();

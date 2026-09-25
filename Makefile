@@ -121,7 +121,8 @@ PICO_LINK  = -s -Wl,--gc-sections \
              -lgcc -nostdlib -nostartfiles -static -no-pie
 
 SRCS = src/pico_exporter.c src/push.c src/otlp.c src/collectors.c \
-       src/arena.c src/dns.c src/linux_sock.c src/bearglue.c
+       src/arena.c src/dns.c src/linux_sock.c src/bearglue.c \
+       src/pdir.c src/idle.c
 OBJS = $(SRCS:.c=.o)
 
 BIN = bin/pico_exporter
