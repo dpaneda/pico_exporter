@@ -19,6 +19,63 @@ if [ ! -x "$BIN" ]; then
   make -C "$DIR" all test-bin >/dev/null
 fi
 
+# idle_sleep drops [PCEIL(.rodata), PFLOOR(min(__tls_space, __data_start)))
+# with MADV_DONTNEED. A written page there would silently revert to the file
+# image, so no writable section other than .data.rel.ro may intersect it, and
+# .data.rel.ro is only clean because a static non-PIE link has no relocations.
+layout_check() { # layout_check <bin> <readelf>
+  local bin="$1" re="$2" out
+  if ! "$re" -rW "$bin" | grep -q "There are no relocations in this file"; then
+    echo "FAIL: layout invariant ($bin): binary has dynamic relocations"
+    fail=1; return
+  fi
+  if out=$("$re" -SW "$bin" | sed 's/\[ *\([0-9]*\)\]/\1/' | awk '
+    function hex(s,   i, v) {
+      v = 0; s = tolower(s)
+      for (i = 1; i <= length(s); i++) v = v * 16 + index("0123456789abcdef", substr(s, i, 1)) - 1
+      return v
+    }
+    $1 ~ /^[0-9]+$/ && NF >= 8 {
+      name = $2; addr = hex($4); size = hex($6)
+      if (name == ".rodata") ro = addr
+      if (name == ".tls_space") ts = addr
+      if (name == ".data") dt = addr
+      if ((name == ".tdata" || name == ".tbss" || name == ".data") && (tl == "" || addr < tl)) tl = addr
+      if ($8 ~ /W/ && size > 0) { n++; wn[n] = name; wa[n] = addr; we[n] = addr + size }
+    }
+    END {
+      if (ro == "" || dt == "") { print "no .rodata or .data section"; exit 1 }
+      top = (ts != "") ? (ts < dt ? ts : dt) : tl
+      lo = int((ro + 4095) / 4096) * 4096
+      hi = int(top / 4096) * 4096
+      bad = 0
+      for (i = 1; i <= n; i++)
+        if (wn[i] != ".data.rel.ro" && wa[i] < hi && we[i] > lo) {
+          printf "%s [0x%x,0x%x) ", wn[i], wa[i], we[i]; bad = 1
+        }
+      printf "[0x%x,0x%x)", lo, hi
+      exit bad
+    }'); then
+    echo "PASS: layout invariant ($bin): no writable section in the evicted rodata range $out"
+  else
+    echo "FAIL: layout invariant ($bin): writable section in the evicted rodata range: $out"
+    fail=1
+  fi
+}
+if command -v readelf >/dev/null; then
+  layout_check "$BIN" readelf
+else
+  echo "SKIP: layout invariant ($BIN): readelf not found"
+fi
+A64="$DIR/bin/pico_exporter-picolibc-aarch64"
+if [ -f "$A64" ]; then
+  if command -v aarch64-linux-gnu-readelf >/dev/null; then
+    layout_check "$A64" aarch64-linux-gnu-readelf
+  else
+    echo "SKIP: layout invariant ($A64): aarch64-linux-gnu-readelf not found"
+  fi
+fi
+
 bash "$DIR/tests/fake_root.sh" "$ROOT"
 
 "$BIN" --path.rootfs="$ROOT" --metrics-once >"$DIR/tests/.M.txt" 2>"$DIR/tests/.metrics.log"
@@ -366,6 +423,18 @@ else
   echo "FAIL: wrong trust anchor not rejected"; echo "$WTOUT"; fail=1
 fi
 
+# --- TLS session-id probe against the real gateway (needs network) ---
+RSOUT="$("$HARNESS" resume 2>&1)"
+if echo "$RSOUT" | grep -q 'SKIP'; then
+  echo "SKIP: TLS session-id probe (no network)"
+elif echo "$RSOUT" | grep -q 'tls_resume: NO SESSION ID'; then
+  echo "SKIP: TLS session resumption (gateway issues no session id; see AGENTS.md)"
+elif echo "$RSOUT" | grep -q 'tls_resume: SESSION ID ISSUED'; then
+  echo "NOTE: gateway now issues TLS session ids -- revisit resumption (see AGENTS.md)"
+else
+  echo "FAIL: TLS session-id probe"; echo "$RSOUT"; fail=1
+fi
+
 # --- oversized-record recovery (bg_test_force_too_large seam in the harness) ---
 if [ -x "$HARNESS" ]; then
   FBOUT="$("$HARNESS" fallback 2>&1)"
@@ -389,7 +458,29 @@ if command -v python3 >/dev/null 2>&1; then
   "$BIN" --path.rootfs="$ROOT" \
     >"$DIR/tests/.push.log" 2>&1 &
   PUSHD=$!
-  sleep 6
+  # --- resting footprint, sampled while the process sleeps between cycles.
+  # smaps_rollup walks the page tables and is exact; VmRSS in status is a
+  # batched per-CPU counter and can lag by up to 128 kB (see AGENTS.md).
+  # Three samples 0.3 s apart, minimum wins, so a sample that lands inside
+  # the ~10 ms cycle cannot fail the gate on its own.
+  sleep 1.5
+  MINFLT0="$(awk '{print $10}' /proc/$PUSHD/stat 2>/dev/null || echo 0)"
+  sleep 2.5
+  # 999999 is the "no sample" sentinel; the loop's own fallback shares it,
+  # so a read that fails can never look like the smallest RSS seen.
+  RSS_MIN=999999
+  for _ in 1 2 3; do
+    r="$(awk '/^Rss:/{print $2}' /proc/$PUSHD/smaps_rollup 2>/dev/null || echo 999999)"
+    r="${r:-999999}"
+    [ "$r" -lt "$RSS_MIN" ] && RSS_MIN="$r"
+    sleep 0.3
+  done
+  HEAPS="$(grep -c '\[heap\]' /proc/$PUSHD/maps 2>/dev/null)"
+  HEAPS="${HEAPS:-0}"
+  sleep 1
+  MINFLT1="$(awk '{print $10}' /proc/$PUSHD/stat 2>/dev/null || echo 0)"
+  ALIVE=0
+  kill -0 "$PUSHD" 2>/dev/null && ALIVE=1
   kill "$PUSHD" "$SINKD" 2>/dev/null
   wait "$PUSHD" 2>/dev/null
   if [ -s "$DIR/tests/.sink.bin" ] \
@@ -398,6 +489,34 @@ if command -v python3 >/dev/null 2>&1; then
   else
     echo "FAIL: push to local sink"
     cat "$DIR/tests/.push.log"
+    fail=1
+  fi
+  if [ "$ALIVE" -eq 1 ]; then
+    if [ "$RSS_MIN" -le 32 ]; then
+      echo "PASS: resting RSS ${RSS_MIN} kB (<= 32 kB, smaps_rollup)"
+    else
+      echo "FAIL: resting RSS ${RSS_MIN} kB (want <= 32 kB)"
+      fail=1
+    fi
+    if [ "${HEAPS:-0}" -eq 0 ]; then
+      echo "PASS: no [heap] mapping"
+    else
+      echo "FAIL: [heap] mapping present (picolibc malloc was called)"
+      fail=1
+    fi
+    # Two INTERVAL=2 cycles fit in the ~4.4 s window; 16 per cycle measured
+    # against the fake rootfs; a real /proc costs more arena pages, hence the
+    # headroom. 320 catches an idle path that drops something live and
+    # thrashes on it.
+    FAULTS=$((MINFLT1 - MINFLT0))
+    if [ "$FAULTS" -ge 0 ] && [ "$FAULTS" -le 320 ]; then
+      echo "PASS: minor faults over two cycles = $FAULTS (<= 320)"
+    else
+      echo "FAIL: minor faults over two cycles = $FAULTS (want 0..320)"
+      fail=1
+    fi
+  else
+    echo "FAIL: exporter exited during the idle window (footprint gates not evaluated)"
     fail=1
   fi
 

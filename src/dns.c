@@ -50,8 +50,10 @@ static int read_ns(struct in_addr *out)
     /* A fixed-size buffer truncates silently: systemd-resolved ships a stub
        resolv.conf whose comment header alone is ~500 B, pushing the
        nameserver line past the end of a 512 B slice and silently falling back
-       to 127.0.0.1. Read to EOF into a roomy static buffer instead. */
-    static char buf[2048];
+       to 127.0.0.1. Read to EOF into a roomy local instead; it only lives
+       while a connection is being opened, on stack pages the idle path hands
+       back. */
+    char buf[2048];
     long n = 0;
     int fd = open("/etc/resolv.conf", O_RDONLY);
     if (fd < 0) return -1;

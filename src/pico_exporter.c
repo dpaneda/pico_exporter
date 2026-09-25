@@ -19,6 +19,7 @@
 #include "arena.h"
 #include "bearglue.h"
 #include "collectors.h"
+#include "idle.h"
 #include "otlp.h"
 #include "push.h"
 
@@ -71,14 +72,6 @@ static void report_capped(const struct metrics *m) {
                 m->ndropped, m->nlabels_capped);
 }
 
-static void msleep(long ms) {
-    if (ms <= 0) return;
-    struct timespec ts;
-    ts.tv_sec = ms / 1000;
-    ts.tv_nsec = (long)(ms % 1000) * 1000000L;
-    nanosleep(&ts, NULL);
-}
-
 static int64_t now_wall_ns(void) {
     struct timespec t;
     clock_gettime(CLOCK_REALTIME, &t);
@@ -90,6 +83,7 @@ static int64_t wall_seconds(void) { return (int64_t)time(NULL); }
 /* pushMain() port: collects on an INTERVAL cycle and pushes OTLP batches. */
 static void push_loop(const struct rw_url *u, const char *auth,
                       const char *rootfs) {
+    idle_stack_floor();
     const char *job = getenv("JOB");
     if (!job || !*job) job = "integrations/node_exporter";
     /* service.instance.id defaults to the node name, which is what a node
@@ -152,7 +146,7 @@ static void push_loop(const struct rw_url *u, const char *auth,
                     "cycle push: no samples\n");
             metrics_free(&m);
             otlp_buf_reset(&wbuf);
-            msleep(interval_ms);
+            idle_sleep(interval_ms);
             continue;
         }
 
@@ -226,7 +220,10 @@ static void push_loop(const struct rw_url *u, const char *auth,
         /* After metrics_free, because that is what runs arena_reset: wbuf's
            region belongs to the cycle that just ended. */
         otlp_buf_reset(&wbuf);
-        msleep(interval_ms);
+        /* After the resets: the arena has already handed its pages back, and
+           idle_sleep evicts what is left -- code, rodata, handshake state,
+           the deep stack -- before sleeping. */
+        idle_sleep(interval_ms);
     }
 }
 

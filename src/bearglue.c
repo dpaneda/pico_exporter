@@ -1,11 +1,12 @@
-/* bearglue.c - static-storage BearSSL client for the remote-write push path.
-   Contexts and the I/O buffer live in .bss and are reused across cycles, so the
-   TLS cost is a fixed constant. */
+/* bearglue.c - heap-free BearSSL client for the remote-write push path.
+   Contexts and the I/O buffer live in two anonymous page mappings (session:
+   kept across cycles; handshake: dropped at idle) and are reused across cycles,
+   so the TLS cost is a fixed constant. */
 #include <stdint.h>
-#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include "bearglue.h"
 #include "bearssl.h"
 
@@ -25,28 +26,44 @@ static size_t                     g_tas_num = 0;
 #endif
 static int                        g_force_too_large = 0;
 
-static br_ssl_client_context   g_cc;
-#ifndef BG_INSECURE_NO_VERIFY
-static br_x509_minimal_context g_xc;
-#endif
-static br_sslio_context        g_ioc;
-/* BG_IOBUF_SIZE (see bearglue.h) asks the peer for a fragment length instead of
-   reserving the 16,709 B that any legal record could need. g_buf starts on this
-   static buffer and only moves to a full-size heap one if a peer actually sends
-   an oversized record. */
 _Static_assert(BG_ERR_TOO_LARGE == BR_ERR_TOO_LARGE,
                "BG_ERR_TOO_LARGE drifted from BearSSL");
 _Static_assert(BG_IOBUF_SIZE <= BR_SSL_BUFSIZE_MONO,
                "BG_MAX_FRAG above 16384 is not a legal fragment length");
-static unsigned char           g_iobuf[BG_IOBUF_SIZE];
-static unsigned char          *g_buf = g_iobuf;
-static size_t                  g_buflen = sizeof g_iobuf;
+
+/* Session state: the client context and the record buffer. Mapped once, on
+   the first handshake, into pages of its own instead of .bss so that what
+   must survive a cycle and what must not never share a page. */
+struct bg_session {
+    br_ssl_client_context cc;
+    unsigned char         iobuf[BG_IOBUF_SIZE];
+};
+static struct bg_session      *g_ss;
+static br_sslio_context        g_ioc;
+
+/* g_buf starts on the session pages' iobuf and only moves to a full-size
+   mapping if a peer actually sends an oversized record. g_buflen is what the
+   fragment-length extension advertises, so it is right before any mapping
+   exists. */
+static unsigned char          *g_buf;
+static size_t                  g_buflen = BG_IOBUF_SIZE;
+
+unsigned char *bg_hs_base;
+size_t         bg_hs_len;
+
 static int                     g_fd = -1;
 static unsigned char           g_seed[64];
 static int                     g_seeded = 0;
 
-/* --- suites TLS 1.2 + AES-128-GCM (A53 no tiene AES-NI pero el endpoint
-   soporta GCM; mantener solo esta suite reduce el código de BearSSL). */
+static void *map_pages(size_t n) {
+    size_t len = (n + 4095) & ~(size_t)4095;
+    void *p = mmap(NULL, len, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return p == MAP_FAILED ? NULL : p;
+}
+
+/* TLS 1.2 + AES-128-GCM only: the A53 has no AES-NI, but the endpoint
+   supports GCM and keeping a single suite shrinks BearSSL's code. */
 static const uint16_t g_suites[] = {
     BR_TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
 };
@@ -106,7 +123,6 @@ typedef struct {
     br_x509_decoder_context  dec;
 } bg_aa_ctx;
 
-static bg_aa_ctx g_aa;
 static const br_x509_class bg_aa_vtable;   /* forward: start_chain stores it */
 
 static void bg_aa_start_chain(const br_x509_class **ctx, const char *name) {
@@ -169,6 +185,31 @@ static const br_x509_class bg_aa_vtable = {
 };
 #endif /* BG_INSECURE_NO_VERIFY */
 
+#ifndef BG_INSECURE_NO_VERIFY
+typedef br_x509_minimal_context bg_hs_ctx;
+#else
+typedef bg_aa_ctx bg_hs_ctx;
+#endif
+static bg_hs_ctx *g_hs;
+
+/* Maps the session and handshake pages the first time. 0 ok, -1 on ENOMEM.
+   g_buf is only pointed at the session iobuf if bg_grow_iobuf has not already
+   moved it: the fallback path can grow before the first mapping exists. */
+static int bg_map(void) {
+    if (!g_ss) {
+        g_ss = map_pages(sizeof *g_ss);
+        if (!g_ss) return -1;
+        if (!g_buf) g_buf = g_ss->iobuf;
+    }
+    if (!g_hs) {
+        g_hs = map_pages(sizeof *g_hs);
+        if (!g_hs) return -1;
+        bg_hs_base = (unsigned char *)g_hs;
+        bg_hs_len = (sizeof *g_hs + 4095) & ~(size_t)4095;
+    }
+    return 0;
+}
+
 /* Handshake over an already-connected fd. days/secs feed X.509 date
    validation. Returns br_ssl_engine_last_error(): 0 means success. */
 int bg_handshake(const char *host, int fd, uint32_t days, uint32_t secs) {
@@ -189,46 +230,50 @@ int bg_handshake(const char *host, int fd, uint32_t days, uint32_t secs) {
         }
     }
     if (!bg_seed()) return -1;
+    if (bg_map() != 0) return -1;
     g_fd = fd;
-    br_ssl_client_zero(&g_cc);
-    br_ssl_engine_set_versions(&g_cc.eng, BR_TLS12, BR_TLS12);
-    br_ssl_engine_set_suites(&g_cc.eng, g_suites,
+    br_ssl_client_zero(&g_ss->cc);
+    br_ssl_engine_set_versions(&g_ss->cc.eng, BR_TLS12, BR_TLS12);
+    br_ssl_engine_set_suites(&g_ss->cc.eng, g_suites,
                              sizeof g_suites / sizeof g_suites[0]);
-    br_ssl_engine_set_ec(&g_cc.eng, &br_ec_p256_m15);
-    br_ssl_engine_set_hash(&g_cc.eng, br_sha256_ID, &br_sha256_vtable);
-    br_ssl_engine_set_prf_sha256(&g_cc.eng, &br_tls12_sha256_prf);
-    br_ssl_engine_set_default_aes_gcm(&g_cc.eng);
+    br_ssl_engine_set_ec(&g_ss->cc.eng, &br_ec_p256_m15);
+    br_ssl_engine_set_hash(&g_ss->cc.eng, br_sha256_ID, &br_sha256_vtable);
+    br_ssl_engine_set_prf_sha256(&g_ss->cc.eng, &br_tls12_sha256_prf);
+    br_ssl_engine_set_default_aes_gcm(&g_ss->cc.eng);
     /* rsavrfy verifies the ServerKeyExchange signature. Omitting it fails with
        26 BR_ERR_INVALID_ALGORITHM; set_default_rsapub is NOT a substitute. */
-    br_ssl_engine_set_default_rsavrfy(&g_cc.eng);
+    br_ssl_engine_set_default_rsavrfy(&g_ss->cc.eng);
+    /* The X.509 context is evicted between cycles; a renegotiation would be
+       the one way for the peer to make BearSSL read it mid-connection. */
+    br_ssl_engine_add_flags(&g_ss->cc.eng, BR_OPT_NO_RENEGOTIATION);
 
-    #ifndef BG_INSECURE_NO_VERIFY
-    br_x509_minimal_init(&g_xc, &br_sha256_vtable, g_tas, g_tas_num);
-    br_x509_minimal_set_hash(&g_xc, br_sha256_ID, &br_sha256_vtable);
-    br_x509_minimal_set_rsa(&g_xc, br_rsa_pkcs1_vrfy_get_default());
+#ifndef BG_INSECURE_NO_VERIFY
+    br_x509_minimal_init(g_hs, &br_sha256_vtable, g_tas, g_tas_num);
+    br_x509_minimal_set_hash(g_hs, br_sha256_ID, &br_sha256_vtable);
+    br_x509_minimal_set_rsa(g_hs, br_rsa_pkcs1_vrfy_get_default());
     /* Set the date explicitly: BearSSL only falls back to time(NULL) when
        BR_USE_UNIX_TIME was detected at compile time, and leaving it unset means
        validation failure. Not depending on that keeps the musl cross-build
        behaving like the native one. */
-    br_x509_minimal_set_time(&g_xc, days, secs);
-    br_ssl_engine_set_x509(&g_cc.eng, &g_xc.vtable);
+    br_x509_minimal_set_time(g_hs, days, secs);
+    br_ssl_engine_set_x509(&g_ss->cc.eng, &g_hs->vtable);
 #else
     /* BearSSL dispatches the first x509 callback by reading the context's
        FIRST slot (the vtable) before calling into it, so the accept-any
        context must be pre-wired here; start_chain re-stores the same value. */
-    g_aa.vtable = &bg_aa_vtable;
-    br_ssl_engine_set_x509(&g_cc.eng, &g_aa.vtable);
+    g_hs->vtable = &bg_aa_vtable;
+    br_ssl_engine_set_x509(&g_ss->cc.eng, &g_hs->vtable);
 #endif
 
-    br_ssl_engine_inject_entropy(&g_cc.eng, g_seed, sizeof g_seed);
-    br_ssl_engine_set_buffer(&g_cc.eng, g_buf, g_buflen, 0);
-    if (!br_ssl_client_reset(&g_cc, host, 0))
-        return br_ssl_engine_last_error(&g_cc.eng);
-    br_sslio_init(&g_ioc, &g_cc.eng, bg_sock_read, &g_fd, bg_sock_write, &g_fd);
+    br_ssl_engine_inject_entropy(&g_ss->cc.eng, g_seed, sizeof g_seed);
+    br_ssl_engine_set_buffer(&g_ss->cc.eng, g_buf, g_buflen, 0);
+    if (!br_ssl_client_reset(&g_ss->cc, host, 0))
+        return br_ssl_engine_last_error(&g_ss->cc.eng);
+    br_sslio_init(&g_ioc, &g_ss->cc.eng, bg_sock_read, &g_fd, bg_sock_write, &g_fd);
     /* Force the handshake to complete now so errors surface here. */
     if (br_sslio_flush(&g_ioc) < 0)
-        return br_ssl_engine_last_error(&g_cc.eng);
-    return br_ssl_engine_last_error(&g_cc.eng);
+        return br_ssl_engine_last_error(&g_ss->cc.eng);
+    return br_ssl_engine_last_error(&g_ss->cc.eng);
 }
 
 int bg_write_all(const unsigned char *buf, int len) {
@@ -245,18 +290,28 @@ void bg_close(void) {
     g_fd = -1;
 }
 
-int bg_last_error(void) { return br_ssl_engine_last_error(&g_cc.eng); }
+int bg_last_error(void) {
+    return g_ss ? br_ssl_engine_last_error(&g_ss->cc.eng) : -1;
+}
 
 int bg_iobuf_size(void) { return (int)g_buflen; }
 
+int bg_session_id_len(void) {
+    br_ssl_session_parameters pp;
+    if (!g_ss) return -1;
+    br_ssl_engine_get_session_parameters(&g_ss->cc.eng, &pp);
+    return pp.session_id_len;
+}
+
 /* Moves to a buffer that holds any legal record, once per process. Returns 1
    when it grew, meaning the caller should retry the handshake on a fresh
-   connection; 0 when already full size or out of memory. The block is kept for
-   the life of the process on purpose: a peer that needed it once will need it
-   every cycle. */
+   connection; 0 when already full size or out of memory. The block is an
+   anonymous mapping kept for the life of the process on purpose: a peer that
+   needed it once will need it every cycle. The small buffer inside the session
+   pages is then simply unused. */
 int bg_grow_iobuf(void) {
     if (g_buflen >= BR_SSL_BUFSIZE_MONO) return 0;
-    unsigned char *p = malloc(BR_SSL_BUFSIZE_MONO);
+    unsigned char *p = map_pages(BR_SSL_BUFSIZE_MONO);
     if (!p) return 0;
     g_buf = p;
     g_buflen = BR_SSL_BUFSIZE_MONO;

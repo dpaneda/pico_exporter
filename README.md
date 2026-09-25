@@ -4,8 +4,9 @@
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![Language](https://img.shields.io/badge/language-C11-orange.svg)]() [![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black)](https://github.com/dpaneda/pico_exporter) [![Targets](https://img.shields.io/badge/targets-x86_64%20%7C%20aarch64-brightgreen.svg)]()
 
-pico_exporter is a **system metrics exporter written in C that runs in about
-120 kiB of memory**. It is a drop-in replacement for the Prometheus
+pico_exporter is a **system metrics exporter written in C that idles in
+28 kiB of memory on a Raspberry Pi** (`smaps_rollup` between push cycles;
+20-32 kiB on x86). It is a drop-in replacement for the Prometheus
 *node_exporter*, but instead of waiting to be scraped it **pushes** the metrics
 to an OTLP gateway over TLS, so there is no need for an extra piece of software
 to pick the metrics up and forward them to the gateway.
@@ -48,9 +49,11 @@ my machine, over the same running window:
 | | Grafana Alloy | pico_exporter | Ratio |
 |---|---|---|---|
 | Binary size | 530 000 kB | 100 kB | **5300× smaller** |
-| Steady RSS | 400 000 kB | 132 kB | **3000× less memory** |
+| Resting RSS | 400 000 kB | 30 kB¹ | **~13 000× less memory**¹ |
 | CPU per day | 516 s | 6 s | **86× less CPU** |
 | Scrape time | 50 ms | 6 ms | **8× faster** |
+
+¹ pico_exporter's figure is `smaps_rollup` between push cycles on the Pi (28 kB measured 2026-09-25, see AGENTS.md), rounded. The ratio is derived from that figure.
 
 ## 👨‍💻 Getting started
 

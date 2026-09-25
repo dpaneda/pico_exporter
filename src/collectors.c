@@ -12,10 +12,7 @@
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE 1
 
-#include <dirent.h>
-#include <errno.h>
 #include <fcntl.h>
-#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -30,6 +27,7 @@
 #include <unistd.h>
 
 #include "collectors.h"
+#include "pdir.h"
 
 static double clk_tick;
 
@@ -122,10 +120,15 @@ static int rbuf_reserve(size_t need) {
 
 /* Read an already-rooted absolute path (avoids re-deriving the rootfs). */
 static long read_abs(const char *path, char *buf, size_t cap) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return -1;
-    size_t n = fread(buf, 1, cap - 1, f);
-    fclose(f);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    size_t n = 0;
+    while (n < cap - 1) {
+        ssize_t r = read(fd, buf + n, cap - 1 - n);
+        if (r <= 0) break;
+        n += (size_t)r;
+    }
+    close(fd);
     if (n == 0) return -1;
     buf[n] = 0;
     while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r' ||
@@ -145,8 +148,8 @@ static const char *read_proc(const char *rootfs, const char *rel) {
     make_path(path, sizeof path, rootfs, rel);
     if (rbuf_reserve(STAT_BUF) != 0) return NULL;
     g_rbuf[0] = 0;
-    FILE *f = fopen(path, "rb");
-    if (!f) return g_rbuf;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return g_rbuf;
     size_t n = 0;
     for (;;) {
         size_t room = g_rcap - n - 1;
@@ -154,11 +157,11 @@ static const char *read_proc(const char *rootfs, const char *rel) {
             if (rbuf_reserve(g_rcap * 2) != 0) break;
             room = g_rcap - n - 1;
         }
-        size_t r = fread(g_rbuf + n, 1, room, f);
-        n += r;
-        if (r < room) break;        /* short read: end of file */
+        ssize_t r = read(fd, g_rbuf + n, room);
+        if (r <= 0) break;         /* 0: end of file */
+        n += (size_t)r;
     }
-    fclose(f);
+    close(fd);
     g_rbuf[n] = 0;
     while (n > 0 && (g_rbuf[n - 1] == '\n' || g_rbuf[n - 1] == '\r' ||
                      g_rbuf[n - 1] == ' '))
@@ -774,20 +777,19 @@ static void collect_network(struct metrics *m) {
         make_path(base, sizeof base, m->rootfs, "sys/class/net");
     else
         strcpy(base, "/sys/class/net");
-    DIR *d = opendir(base);
-    if (!d) return;
-    struct dirent *e;
+    struct pdir d;
+    if (pdir_open(&d, base) != 0) return;
+    const char *e;
     size_t nmax = 0;
-    while ((e = readdir(d)) != NULL) nmax++;
-    closedir(d);                        /* no rewinddir under picolibc */
+    while ((e = pdir_next(&d)) != NULL) nmax++;
+    pdir_close(&d);
     struct nif *ifs = m_alloc(m, nmax * sizeof *ifs);
     if (!ifs) return;
     int nifs = 0;
-    d = opendir(base);
-    if (!d) return;
-    while ((e = readdir(d)) != NULL) {
-        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0 ||
-            strcmp(e->d_name, "lo") == 0)
+    if (pdir_open(&d, base) != 0) return;
+    while ((e = pdir_next(&d)) != NULL) {
+        if (strcmp(e, ".") == 0 || strcmp(e, "..") == 0 ||
+            strcmp(e, "lo") == 0)
             continue;
         if ((size_t)nifs >= nmax) break;
         struct nif *n = &ifs[nifs];
@@ -797,7 +799,7 @@ static void collect_network(struct metrics *m) {
         int got = 0;
         for (size_t i = 0; i < NN; i++) {
             char path[PATH_CAP];
-            if (PATH_FMT(path, "%s/%s/statistics/%s", base, e->d_name,
+            if (PATH_FMT(path, "%s/%s/statistics/%s", base, e,
                          nstats[i].file))
                 continue;
             char vb[40];
@@ -807,10 +809,10 @@ static void collect_network(struct metrics *m) {
             }
         }
         if (!got) continue;
-        if (NAME_CPY(n->dev, e->d_name)) continue;
+        if (NAME_CPY(n->dev, e)) continue;
         nifs++;
     }
-    closedir(d);
+    pdir_close(&d);
     for (size_t i = 0; i < NN; i++) {
         char mname[96];
         snprintf(mname, sizeof mname, "node_network_%s", nstats[i].suffix);
@@ -896,28 +898,28 @@ static void collect_cpufreq(struct metrics *m) {
         make_path(base, sizeof base, m->rootfs, "sys/devices/system/cpu");
     else
         strcpy(base, "/sys/devices/system/cpu");
-    DIR *d = opendir(base);
-    if (!d) return;
-    struct dirent *e;
-    while ((e = readdir(d)) != NULL) {
-        if (strncmp(e->d_name, "cpu", 3) != 0) continue;
-        if (strlen(e->d_name) <= 3 || !is_all_digits(e->d_name + 3)) continue;
+    struct pdir d;
+    if (pdir_open(&d, base) != 0) return;
+    const char *e;
+    while ((e = pdir_next(&d)) != NULL) {
+        if (strncmp(e, "cpu", 3) != 0) continue;
+        if (strlen(e) <= 3 || !is_all_digits(e + 3)) continue;
         char cdir[PATH_CAP];
-        if (PATH_FMT(cdir, "%s/%s/cpufreq", base, e->d_name)) continue;
-        DIR *cf = opendir(cdir);
-        if (!cf) continue;
-        closedir(cf);
+        if (PATH_FMT(cdir, "%s/%s/cpufreq", base, e)) continue;
+        int cfd = open(cdir, O_RDONLY);
+        if (cfd < 0) continue;
+        close(cfd);
         char chip[128];
-        snprintf(chip, sizeof chip, "chip=\"%s\"", e->d_name);
+        snprintf(chip, sizeof chip, "chip=\"%s\"", e);
         char cur[128] = "", maxf[128] = "", minf[128] = "", gov[128] = "";
         char path[PATH_CAP];
-        if (!PATH_FMT(path, "%s/%s/cpufreq/scaling_cur_freq", base, e->d_name))
+        if (!PATH_FMT(path, "%s/%s/cpufreq/scaling_cur_freq", base, e))
             read_abs(path, cur, sizeof cur);
-        if (!PATH_FMT(path, "%s/%s/cpufreq/cpuinfo_max_freq", base, e->d_name))
+        if (!PATH_FMT(path, "%s/%s/cpufreq/cpuinfo_max_freq", base, e))
             read_abs(path, maxf, sizeof maxf);
-        if (!PATH_FMT(path, "%s/%s/cpufreq/cpuinfo_min_freq", base, e->d_name))
+        if (!PATH_FMT(path, "%s/%s/cpufreq/cpuinfo_min_freq", base, e))
             read_abs(path, minf, sizeof minf);
-        if (!PATH_FMT(path, "%s/%s/cpufreq/scaling_governor", base, e->d_name))
+        if (!PATH_FMT(path, "%s/%s/cpufreq/scaling_governor", base, e))
             read_abs(path, gov, sizeof gov);
 
         char v[40];
@@ -942,7 +944,7 @@ static void collect_cpufreq(struct metrics *m) {
             metrics_line(m, "node_cpufreq_scaling_governor", l, "1");
         }
     }
-    closedir(d);
+    pdir_close(&d);
 }
 
 /* Entries of /sys/block that carry no partitions and no stats worth walking. */
@@ -956,7 +958,7 @@ static bool skip_blockdev(const char *n) {
    prefix is a sound pre-filter for the authoritative `partition` attribute.
    Without it the walk stats every one of the ~30 other entries a sysfs block
    directory carries (queue, power, holders, ...), which on the Pi was 32
-   fopen calls to find 2 partitions. */
+   file opens to find 2 partitions. */
 static bool is_part_of(const char *entry, const char *disk) {
     size_t dl = strlen(disk);
     return strncmp(entry, disk, dl) == 0 && entry[dl] != 0;
@@ -976,55 +978,56 @@ static void collect_diskstats(struct metrics *m) {
     struct paren { char part[32], parent[32]; };
     size_t pmax = 0;
     {
-        DIR *cd = opendir(sbase);
-        if (cd) {
-            struct dirent *ce;
-            while ((ce = readdir(cd)) != NULL) {
+        struct pdir cd;
+        if (pdir_open(&cd, sbase) == 0) {
+            const char *ce;
+            while ((ce = pdir_next(&cd)) != NULL) {
                 /* Same filter as the walk below. Without it this counted the
                    contents of every loop/ram device -- and of "." and "..",
-                   so it opened and read all of /sys as well: 27 opendir and
-                   ~800 readdir per cycle on the Pi to size an array of 2. */
-                if (skip_blockdev(ce->d_name)) continue;
+                   so it opened and walked all of /sys as well: 27 directory
+                   opens and ~800 entries read per cycle on the Pi to size an
+                   array of 2. */
+                if (skip_blockdev(ce)) continue;
                 char cd2[PATH_CAP];
-                if (PATH_FMT(cd2, "%s/%s", sbase, ce->d_name)) continue;
-                DIR *sd = opendir(cd2);
-                if (!sd) continue;
-                struct dirent *se;
-                while ((se = readdir(sd)) != NULL)
-                    if (is_part_of(se->d_name, ce->d_name)) pmax++;
-                closedir(sd);
+                if (PATH_FMT(cd2, "%s/%s", sbase, ce)) continue;
+                struct pdir sd;
+                if (pdir_open(&sd, cd2) != 0) continue;
+                const char *se;
+                while ((se = pdir_next(&sd)) != NULL)
+                    if (is_part_of(se, ce)) pmax++;
+                pdir_close(&sd);
             }
-            closedir(cd);
+            pdir_close(&cd);
         }
     }
     struct paren *par = pmax ? m_alloc(m, pmax * sizeof *par) : NULL;
     int np = 0;
-    DIR *bd = opendir(sbase);
-    if (bd) {
-        struct dirent *be;
-        while ((be = readdir(bd)) != NULL) {
-            if (skip_blockdev(be->d_name)) continue;
-            char pdir[PATH_CAP];
-            if (PATH_FMT(pdir, "%s/%s", sbase, be->d_name)) continue;
-            DIR *pd = opendir(pdir);
-            if (!pd) continue;
-            struct dirent *pe;
-            while ((pe = readdir(pd)) != NULL) {
-                if (!is_part_of(pe->d_name, be->d_name)) continue;
+    struct pdir bd;
+    if (pdir_open(&bd, sbase) == 0) {
+        const char *be;
+        while ((be = pdir_next(&bd)) != NULL) {
+            if (skip_blockdev(be)) continue;
+            char devdir[PATH_CAP];
+            if (PATH_FMT(devdir, "%s/%s", sbase, be)) continue;
+            struct pdir pd;
+            if (pdir_open(&pd, devdir) != 0) continue;
+            const char *pe;
+            while ((pe = pdir_next(&pd)) != NULL) {
+                if (!is_part_of(pe, be)) continue;
                 char pf[PATH_CAP];
-                if (PATH_FMT(pf, "%s/%s/partition", pdir, pe->d_name)) continue;
-                FILE *f = fopen(pf, "r");
-                if (f) {
-                    fclose(f);
+                if (PATH_FMT(pf, "%s/%s/partition", devdir, pe)) continue;
+                int pfd = open(pf, O_RDONLY);
+                if (pfd >= 0) {
+                    close(pfd);
                     if (par && (size_t)np < pmax &&
-                        !NAME_CPY(par[np].part, pe->d_name) &&
-                        !NAME_CPY(par[np].parent, be->d_name))
+                        !NAME_CPY(par[np].part, pe) &&
+                        !NAME_CPY(par[np].parent, be))
                         np++;
                 }
             }
-            closedir(pd);
+            pdir_close(&pd);
         }
-        closedir(bd);
+        pdir_close(&bd);
     }
 
     char *toks[24];
@@ -1239,44 +1242,33 @@ static void collect_hwmon(struct metrics *m) {
         make_path(hbase, sizeof hbase, m->rootfs, "sys/class/hwmon");
     else
         strcpy(hbase, "/sys/class/hwmon");
-    DIR *hw = opendir(hbase);
-    if (hw) {
-        struct dirent *e;
-        while ((e = readdir(hw)) != NULL) {
-            if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+    struct pdir hw;
+    if (pdir_open(&hw, hbase) == 0) {
+        const char *e;
+        while ((e = pdir_next(&hw)) != NULL) {
+            if (strcmp(e, ".") == 0 || strcmp(e, "..") == 0)
                 continue;
             char cdir[PATH_CAP];
-            if (PATH_FMT(cdir, "%s/%s", hbase, e->d_name)) continue;
+            if (PATH_FMT(cdir, "%s/%s", hbase, e)) continue;
             /* chip name */
             char fname[PATH_CAP], chip[128];
             if (PATH_FMT(fname, "%s/name", cdir)) continue;
-            {
-                FILE *f = fopen(fname, "r");
-                if (!f) continue;
-                size_t nr = fread(chip, 1, sizeof chip - 1, f);
-                fclose(f);
-                chip[nr] = 0;
-                while (nr > 0 && (chip[nr - 1] == '\n' || chip[nr - 1] == '\r' ||
-                                  chip[nr - 1] == ' '))
-                    chip[--nr] = 0;
-                if (!chip[0]) continue;
-            }
+            if (read_abs(fname, chip, sizeof chip) <= 0) continue;
             /* One slot per sensor, counted from the chip directory: a fixed
                16 dropped sensors on a chip that exposes more. */
             struct tval { char num[16]; double c; };
-            DIR *cd = opendir(cdir);
-            if (!cd) continue;
-            struct dirent *fe;
+            struct pdir cd;
+            if (pdir_open(&cd, cdir) != 0) continue;
+            const char *fe;
             size_t tmax = 0;
-            while ((fe = readdir(cd)) != NULL) tmax++;
-            closedir(cd);
+            while ((fe = pdir_next(&cd)) != NULL) tmax++;
+            pdir_close(&cd);
             struct tval *temps = m_alloc(m, tmax * sizeof *temps);
             if (!temps) continue;
             int nt = 0;
-            cd = opendir(cdir);
-            if (!cd) continue;
-            while ((fe = readdir(cd)) != NULL) {
-                char *fn = fe->d_name;
+            if (pdir_open(&cd, cdir) != 0) continue;
+            while ((fe = pdir_next(&cd)) != NULL) {
+                const char *fn = fe;
                 if (!has_prefix(fn, "temp")) continue;
                 size_t nl = strlen(fn);
                 size_t sl = 6;   /* strlen("_input") */
@@ -1287,22 +1279,14 @@ static void collect_hwmon(struct metrics *m) {
                 num[nn] = 0;
                 if (nn == 0 || !is_all_digits(num)) continue;
                 if (PATH_FMT(fname, "%s/temp%s_input", cdir, num)) continue;
-                FILE *f = fopen(fname, "r");
-                if (!f) continue;
-                size_t nr = fread(vb, 1, sizeof vb - 1, f);
-                fclose(f);
-                vb[nr] = 0;
-                while (nr > 0 && (vb[nr - 1] == '\n' || vb[nr - 1] == '\r' ||
-                                  vb[nr - 1] == ' '))
-                    vb[--nr] = 0;
-                if (!vb[0]) continue;
+                if (read_abs(fname, vb, sizeof vb) <= 0) continue;
                 if ((size_t)nt < tmax) {
                     temps[nt].c = strtod(vb, NULL) / 1000.0;
                     snprintf(temps[nt].num, sizeof temps[0].num, "%s", num);
                     nt++;
                 }
             }
-            closedir(cd);
+            pdir_close(&cd);
             if (nt > 0) {
                 char l[400], l2[400];
                 snprintf(l, sizeof l, "chip=\"%s\",chip_name=\"%s\"", chip,
@@ -1313,21 +1297,8 @@ static void collect_hwmon(struct metrics *m) {
                     if (PATH_FMT(fname, "%s/temp%s_label", cdir,
                                  temps[i].num))
                         continue;
-                    FILE *f = fopen(fname, "r");
-                    if (f) {
-                        size_t nr = fread(label, 1, sizeof label - 1, f);
-                        fclose(f);
-                        label[nr] = 0;
-                        while (nr > 0 &&
-                               (label[nr - 1] == '\n' || label[nr - 1] == '\r'))
-                            label[--nr] = 0;
-                        if (!label[0]) {
-                            label[0] = 0;
-                            snprintf(label, sizeof label, "%s", chip);
-                        }
-                    } else {
+                    if (read_abs(fname, label, sizeof label) <= 0)
                         snprintf(label, sizeof label, "%s", chip);
-                    }
                     char v[40];
                     fmt_float(v, temps[i].c);
                     snprintf(l2, sizeof l2, "chip=\"%s\",label=\"%s\"", chip,
@@ -1336,7 +1307,7 @@ static void collect_hwmon(struct metrics *m) {
                 }
             }
         }
-        closedir(hw);
+        pdir_close(&hw);
     }
 
     char tbase[PATH_CAP];
@@ -1344,29 +1315,21 @@ static void collect_hwmon(struct metrics *m) {
         make_path(tbase, sizeof tbase, m->rootfs, "sys/class/thermal");
     else
         strcpy(tbase, "/sys/class/thermal");
-    DIR *td = opendir(tbase);
-    if (td) {
-        struct dirent *e;
-        while ((e = readdir(td)) != NULL) {
-            if (!has_prefix(e->d_name, "thermal_zone")) continue;
+    struct pdir td;
+    if (pdir_open(&td, tbase) == 0) {
+        const char *e;
+        while ((e = pdir_next(&td)) != NULL) {
+            if (!has_prefix(e, "thermal_zone")) continue;
             char tf[PATH_CAP];
-            if (PATH_FMT(tf, "%s/%s/temp", tbase, e->d_name)) continue;
+            if (PATH_FMT(tf, "%s/%s/temp", tbase, e)) continue;
             char vb[128];
-            FILE *f = fopen(tf, "r");
-            if (!f) continue;
-            size_t nr = fread(vb, 1, sizeof vb - 1, f);
-            fclose(f);
-            vb[nr] = 0;
-            while (nr > 0 && (vb[nr - 1] == '\n' || vb[nr - 1] == '\r' ||
-                              vb[nr - 1] == ' '))
-                vb[--nr] = 0;
-            if (!vb[0]) continue;
+            if (read_abs(tf, vb, sizeof vb) <= 0) continue;
             char v[40], l[270];
             fmt_float(v, strtod(vb, NULL) / 1000.0);
-            snprintf(l, sizeof l, "zone=\"%s\"", e->d_name);
+            snprintf(l, sizeof l, "zone=\"%s\"", e);
             metrics_line(m, "node_thermal_zone_temp", l, v);
         }
-        closedir(td);
+        pdir_close(&td);
     }
 }
 
@@ -1467,33 +1430,33 @@ static bool textfile_line(struct metrics *m, char *line) {
 static void collect_textfile(struct metrics *m) {
     if (!g_textfile_dir) return;
 
-    DIR *d = opendir(g_textfile_dir);
-    if (!d) {
+    struct pdir d;
+    if (pdir_open(&d, g_textfile_dir) != 0) {
         metrics_line(m, "node_textfile_scrape_error", "", "1");
         return;
     }
 
     int failed = 0;
-    struct dirent *e;
-    while ((e = readdir(d)) != NULL) {
-        size_t n = strlen(e->d_name);
-        if (n < 6 || strcmp(e->d_name + n - 5, ".prom") != 0) continue;
+    const char *e;
+    while ((e = pdir_next(&d)) != NULL) {
+        size_t n = strlen(e);
+        if (n < 6 || strcmp(e + n - 5, ".prom") != 0) continue;
 
         char path[PATH_CAP];
-        if (PATH_FMT(path, "%s/%s", g_textfile_dir, e->d_name)) { failed++; continue; }
+        if (PATH_FMT(path, "%s/%s", g_textfile_dir, e)) { failed++; continue; }
 
         struct stat st;
         if (stat(path, &st) != 0) { failed++; continue; }
 
         char label[PATH_CAP], mtime[40];
-        if (snprintf(label, sizeof label, "file=\"%s\"", e->d_name) < (int)sizeof label) {
+        if (snprintf(label, sizeof label, "file=\"%s\"", e) < (int)sizeof label) {
             fmt_float(mtime, (double)st.st_mtime);
             metrics_line(m, "node_textfile_mtime_seconds", label, mtime);
         }
 
         /* read_proc hands back the one shared buffer, so a file has to be
            parsed to the end before the next one is read. */
-        char *buf = (char *)read_proc(g_textfile_dir, e->d_name);
+        char *buf = (char *)read_proc(g_textfile_dir, e);
         if (!buf) { failed++; continue; }
 
         for (char *line = buf; *line; ) {
@@ -1504,7 +1467,7 @@ static void collect_textfile(struct metrics *m) {
             line = nl + 1;
         }
     }
-    closedir(d);
+    pdir_close(&d);
 
     metrics_line(m, "node_textfile_scrape_error", "", failed ? "1" : "0");
 }
@@ -1574,8 +1537,8 @@ void metrics_free(struct metrics *m) {
 
     if (m->ar) {
         /* Rewind + MADV_DONTNEED: evict the cycle's pages during the sleep so
-           only the ~140 kB baseline stays resident, not the ~113 kB of sample
-           and label memory the collection just touched. */
+           only the resting baseline stays resident (see AGENTS.md), not the
+           sample and label memory the collection just touched. */
         arena_reset(m->ar);
         rbuf_cycle_end();
         return;
