@@ -5,8 +5,7 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![Language](https://img.shields.io/badge/language-C11-orange.svg)]() [![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black)](https://github.com/dpaneda/pico_exporter) [![Targets](https://img.shields.io/badge/targets-x86_64%20%7C%20aarch64-brightgreen.svg)]()
 
 pico_exporter is a **system metrics exporter written in C that idles in
-28 kiB of memory on a Raspberry Pi** (`smaps_rollup` between push cycles;
-20-32 kiB on x86). It is a drop-in replacement for the Prometheus
+28 kiB of memory on a Raspberry Pi**. It is a drop-in replacement for the Prometheus
 *node_exporter*, but instead of waiting to be scraped it **pushes** the metrics
 to an OTLP gateway over TLS, so there is no need for an extra piece of software
 to pick the metrics up and forward them to the gateway.
