@@ -53,8 +53,6 @@ my machine, over the same running window:
 | CPU per day | 516 s | 6 s | **86× less CPU** |
 | Scrape time | 50 ms | 6 ms | **8× faster** |
 
-¹ pico_exporter's figure is `smaps_rollup` between push cycles on the Pi (28 kB measured 2026-09-25, see AGENTS.md), rounded. The ratio is derived from that figure.
-
 ## 👨‍💻 Getting started
 
 1.  Download the binary for your architecture from the latest
