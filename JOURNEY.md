@@ -175,6 +175,22 @@ All of that lands at the roughly 120 kB it sits at today. I would have liked
 to get under 100 kB and I do not see how. If you can, the repo is right
 here.
 
+## 2026-09-25 Cheating the system
+
+Working on another project where I tried to achieve the minimum RSS possible for
+a process give me an idea and I was able to gain another 5x with an ugly hack.
+Right now most of the memory is evictable memory, mainly code pages. But we don't
+need the code pages when we go to sleep right? So we just need to ask the kernel
+to evict all the in the same way that we did with the arena. The (very obscure)
+implementation of that is on https://github.com/dpaneda/pico_exporter/pull/1, with a
+nice touch of a faster scrape time due to reading files with just syscalls, no stdio.
+
+This is not really a reasonable thing to do in general obviously. The kernel will
+need to get those pages on every cycle. Although is very little memory, so is a very
+cheap thing to do in this case.
+
+Now it seems the the memory floor is hard to move, with 28 KiB at rest.
+
 ## What the LLM was good at, and what it was not
 
 The implementation work by the LLM was genuinely impressive sometimes. It wrote
