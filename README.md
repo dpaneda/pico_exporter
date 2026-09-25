@@ -48,7 +48,7 @@ my machine, over the same running window:
 | | Grafana Alloy | pico_exporter | Ratio |
 |---|---|---|---|
 | Binary size | 530 000 kB | 100 kB | **5300× smaller** |
-| Resting RSS | 400 000 kB | 30 kB¹ | **~13 000× less memory**¹ |
+| Resting RSS | 400 000 kB | 30 kB | **~13 000× less memory** |
 | CPU per day | 516 s | 6 s | **86× less CPU** |
 | Scrape time | 50 ms | 6 ms | **8× faster** |
 
