@@ -39,11 +39,11 @@ my machine, over the same running window:
 | Binary size | 530 000 kB | 100 kB | **5300× smaller** |
 | Resting RSS | 400 000 kB | 30 kB | **~13 000× less memory** |
 | CPU per day | 516 s | 6 s | **86× less CPU** |
-| Scrape time | 50 ms | 6 ms | **8× faster** |
+| Collection time | 50 ms | 6 ms | **8× faster** |
 
 ## ⚖️ Alternatives
 
-Compared with the usual alternatives, [Grafana Alloy](https://github.com/grafana/alloy) and the Prometheus *node_exporter*:
+Compared with [Grafana Alloy](https://github.com/grafana/alloy) and the Prometheus *node_exporter*:
 
 | | pico_exporter | Grafana Alloy | node_exporter |
 |---|---|---|---|
@@ -81,16 +81,6 @@ For building from source and the host prerequisites, see
 ## ⚙️ Configuration
 
 Configuration is environment-based:
-
-| Env | Required | Default | Meaning |
-|---|---|---|---|
-| `GW_URL` | yes | none | push endpoint, `https://host[:port]/path` or `http://…` |
-| `GW_USER` / `GW_PASS` | no | empty | HTTP Basic-auth (Grafana Cloud: stack id / `glc_…`) |
-| `JOB` | no | `integrations/node_exporter` | OTel `service.name` → Prometheus `job` |
-| `INSTANCE` | no | `uname -n` | OTel `service.instance.id` → Prometheus `instance`. Set it when two exporters share a host so they do not collide into one series |
-| `INTERVAL` | no | `15` | collection/push cycle in seconds |
-| `BATCH` | no | `100` | samples per OTLP request |
-| `TEXTFILE_DIR` | no | unset | directory of `*.prom` files to fold into each push; unset disables the collector |
 
 | Env | Required | Default | Meaning |
 |---|---|---|---|
