@@ -57,6 +57,15 @@ depends on real validation.
 suite covers is in [AGENTS.md](AGENTS.md); cases needing network or `python3`
 SKIP cleanly when either is missing.
 
+One extra case is deliberately NOT part of the build: the `fmt` sweep is
+normally pinned against the harness's own libc (glibc). `tests/picolibc.sh`
+preserves the original picolibc check -- it fetches + builds a picolibc
+install under `build/deps/picolibc-oracle` (first time only, ~1 min), compiles
+`build/tests/run_tests-picolibc` from the same sweep and runs it, so the
+decimal layer keeps being verified against the libc it replaced. `make`/the
+ordinary build never need picolibc; provisioning failures are SKIPs. Reset
+with `rm -rf build/deps/picolibc-oracle`.
+
 ## Source layout
 
 Per-file detail is in [AGENTS.md](AGENTS.md).

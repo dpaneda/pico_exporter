@@ -104,7 +104,11 @@ issue #2 notes): once nothing called printf or strtod, what was left linking
 from picolibc was _start, a handful of syscall wrappers and str/mem -- small
 enough to stop importing. src/start.c, src/freestand.c and src/alloc.c plus
 src/pico.ld are that replacement, and picolibc with its meson build is gone
-from the repo's dependencies.
+from the repo's dependencies. One by-product it left behind is honored, on
+demand: picolibc's printf/strtod were the oracle that shaped tests/fmt.c's
+round-tripping decimal layer, and tests/picolibc.sh rebuilds just enough
+picolibc (cached under build/deps/picolibc-oracle) to keep running that
+comparison whenever asked -- nothing in the build needs it.
 
 Then TLS, same reason. I had started on WolfSSL, picked because it was a lot
 smaller than OpenSSL, which is where the model reached first and which for

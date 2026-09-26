@@ -9,7 +9,8 @@
  * constants. Both were validated against glibc on ~3.5M values (random bit
  * patterns, powers of two +-1 ulp, metrics-like scalings) with zero
  * mismatches; tests/run_tests fmt re-checks the sweep against the harness's
- * own libc on every run.
+ * own libc on every run, and tests/picolibc.sh re-runs the identical sweep
+ * with picolibc's printf/strtod in the oracle seat on demand.
  */
 
 #include "fmt.h"

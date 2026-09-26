@@ -399,6 +399,23 @@ else
   echo "SKIP: fmt layer (build/tests/run_tests missing)"
 fi
 
+# --- fmt layer vs picolibc: same sweep, provisioned on demand --------------
+# tests/picolibc.sh fetches + builds a host picolibc under build/deps/
+# (first time only) and runs the identical sweep with picolibc's
+# printf/strtod in the oracle seat. Not part of the build; provisioning
+# failures are SKIPs, a failing sweep is a FAIL.
+PCOUT="$(bash "$DIR/tests/picolibc.sh" 2>&1)"; PCRC=$?
+case "$PCRC" in
+  0)
+    if echo "$PCOUT" | grep -q 'fmt: OK'; then
+      echo "PASS: fmt layer vs picolibc ($(echo "$PCOUT" | grep -ao '[0-9]* values' | cut -d' ' -f1) values)"
+    else
+      echo "FAIL: fmt layer vs picolibc"; echo "$PCOUT"; fail=1
+    fi ;;
+  77) echo "$PCOUT" | grep -m1 '^SKIP' ;;
+  *) echo "FAIL: fmt picolibc oracle (exit $PCRC)"; echo "$PCOUT"; fail=1 ;;
+esac
+
 # --- keep-alive: 3 POSTs over one connection ---
 if command -v python3 >/dev/null 2>&1; then
   rm -f "$DIR/tests/.sink_keepalive.bin"

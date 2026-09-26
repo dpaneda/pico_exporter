@@ -166,7 +166,10 @@ steady-state builds stay no-ops.
   `brssl ta` tool.)
 - Nothing else. The libc role is filled by src/start.c + src/freestand.c +
   src/alloc.c + src/pico.ld, compiled with the flags already in the Makefile;
-  there is no picolibc, no meson, no ninja, no libc tarball.
+  there is no picolibc, no meson, no ninja, no libc tarball. (One test-side
+  exception: `tests/picolibc.sh` can provision a picolibc install under
+  `build/deps/picolibc-oracle` for the fmt-vs-picolibc oracle case — on
+  demand, never part of any build.)
 
 ## Runtime
 
@@ -511,7 +514,9 @@ Rules that follow from the measurement:
   against the exact round-to-nearest interval; `fmt_f64_parse` is a
   correctly rounded strtod replacement over plain decimal constants
   (127-bit-collapse math, validated against host glibc on ~3.5M values and
-  pinned by `run_tests fmt`, which now uses glibc as the oracle). glibc's
+  pinned by `run_tests fmt`, which now uses glibc as the oracle; the
+  picolibc check that used to live in this case is kept on demand by
+  `tests/picolibc.sh`). glibc's
   strtod agrees with my parser everywhere measured; picolibc's (the old
   oracle) was 1 ulp off on >17-significant-digit inputs, which is why
   `run_tests fmt` still only enforces bit-equality inside 17 digits and
@@ -550,7 +555,17 @@ suite actually covers:
     an **independent protobuf walker** (no golden fixtures);
   - `fmt` — the decimal layer vs glibc's printf/strtod, the harness's own
     libc since the freestanding switch (render byte-equality with the `%.17g`
-    walk, parser bit-equality within 17 significant digits).
+    walk, parser bit-equality within 17 significant digits);
+  - `fmt vs picolibc` — `tests/picolibc.sh`: the *same* sweep out of
+    `tests/fmt_check.inc`, compiled against a picolibc install it provisions
+    itself under `build/deps/picolibc-oracle` (host x86_64, sha256-pinned
+    release + meson; first run fetches + builds it, cached thereafter) with
+    picolibc's printf/strtod in the oracle seat. Kept because picolibc's
+    rounding was the original decimal-layer oracle and a mismatch would be a
+    real regression — but never wired into `make` or any build, so clones pay
+    no picolibc dependency for one test; provisioning failures exit 77, which
+    `run.sh` records as SKIP (offline, missing ninja), a failing sweep as
+    FAIL. Reset with `rm -rf build/deps/picolibc-oracle`.
 - **Sink decode** (`verify_batch.py`): totals frames/series; the one-cycle test
   proves `pushed series == dumped samples + up`.
 - TLS cases need network; they `SKIP` cleanly when offline. The python3-based
