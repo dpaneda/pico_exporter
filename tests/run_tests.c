@@ -776,7 +776,7 @@ static void fmt_check_value(double v, int *fails, long *ntest) {
     (*ntest)++;
     if (strcmp(mine, walk) != 0) {
         if (*fails < 10)
-            printf("  FAIL fmt render: %.17g -> mine %s, %.*g-walk %s\n",
+            printf("  FAIL fmt render: %.17g -> mine %s, walk %s\n",
                    v, mine, walk);
         (*fails)++;
         return;
@@ -867,8 +867,8 @@ static int cmd_fmt(void) {
     }
 
     if (fails == 0)
-        printf("fmt: OK (%ld values; render byte-identical to the %.*g walk, "
-               "parser bit-equal to strtod)\n", ntest, 17);
+        printf("fmt: OK (%ld values; render byte-identical to the %%.17g walk, "
+               "parser bit-equal to strtod)\n", ntest);
     else
         printf("fmt: %d FAILURES (%ld values)\n", fails, ntest);
     return fails != 0;
