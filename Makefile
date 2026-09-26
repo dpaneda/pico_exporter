@@ -1,12 +1,14 @@
-# Makefile - pico_exporter. Everything links against picolibc: the x86_64
-# dev/tests build uses a host picolibc install (built on demand by
-# tools/deps.sh), the aarch64 deployable uses the aarch64 picolibc install.
-# build.sh does the aarch64 link, reading its flags back out of this file.
+# Makefile - pico_exporter. Both binaries are freestanding: compiled against
+# the host/cross cc's own headers for declarations only, and linked
+# -nostdlib -static with src/pico.ld + the in-repo runtime in src/start.c,
+# src/freestand.c and src/alloc.c ( Ersatz of crt0 + syscall wrappers + libc).
+# Only BearSSL is an external dependency. build.sh does the aarch64 link,
+# reading its flags back out of this file.
 #
-#   make            bin/pico_exporter (static x86_64 picolibc) for dev/tests
+#   make            bin/pico_exporter (static x86_64 freestanding) for dev/tests
 #   make debug      -O0 -g build
 #   make aarch64    static aarch64 deployable (and the x86_64 dev binary) via build.sh
-#   make deps       self-bootstrap all deps into build/deps/ (gitignored)
+#   make deps       self-bootstrap BearSSL into build/deps/ (gitignored)
 #   make doctor     check host prerequisites (names missing tools)
 #   make clean      remove build outputs but keep build/deps/ cached
 #   make distclean  remove build/ entirely (deps included)
@@ -19,21 +21,30 @@ CC      ?= cc
 # Two things are deliberately kept out of it, because they are not portable
 # across the two links:
 #
-# -mstack-protector-guard=global: x86_64 only. This Linux gcc defaults to the
-# glibc TLS canary (read via %fs:0x28), but picolibc seeds a GLOBAL
-# __stack_chk_guard. The mismatch is fatal: the TLS slot is overwritten while
-# the heap grows (any /proc file >= 4095 B), so read_proc "detected" a phantom
-# stack smash and aborted. Forcing the global guard matches the picolibc
-# runtime exactly. The aarch64 gcc rejects the option and needs nothing.
+# -mstack-protector-guard=global: x86_64 only. src/start.c seeds a GLOBAL
+# __stack_chk_guard (from auxv's AT_RANDOM), and this Linux gcc's default is
+# the glibc TLS canary read via %fs:0x28 -- a slot nothing sets up on a
+# -nostdlib link. The mismatch was fatal: the TLS slot was overwritten while
+# the heap grew (any /proc file >= 4095 B), so read_proc "detected" a phantom
+# stack smash and aborted. Forcing the global guard matches src/start.c's
+# runtime. The aarch64 gcc defaults to the global guard already.
 #
 # $(TA_DEF): carries shell quoting ('"header.h"') that only survives make's own
 # recipe expansion. build.sh rebuilds that one flag itself from the plain
 # TA_DIR/TA_HNAME it reads back.
-CORE_CFLAGS = -std=c11 -Os -flto -ffunction-sections -fdata-sections \
+CORE_CFLAGS = -std=c11 -Os -flto=auto -ffunction-sections -fdata-sections \
               -fno-asynchronous-unwind-tables -fno-unwind-tables \
               -Wall -Wextra -U_FORTIFY_SOURCE $(FEATURE_DEFS)
 CFLAGS   = $(CORE_CFLAGS) -mstack-protector-guard=global $(TA_DEF)
 CPPFLAGS = -Isrc -Ivendor -Isrv
+
+# Per-object extras for the runtime TUs (see FS_OBJS further down): they
+# define the libc entry-point names (memcpy & friends), which at default
+# flags the compiler is licensed to optimize into calls to themselves, and
+# start.c runs before the stack guard is seeded. FS_CFLAGS is the empty
+# default that the explicit target-specific override below replaces.
+FS_FLAGS = -fno-builtin -fno-stack-protector
+FS_CFLAGS :=
 
 # Read a variable back out of the Makefile. This is the seam build.sh uses;
 # every value it prints must be free of shell quoting (see $(TA_DEF) above).
@@ -97,32 +108,26 @@ FEATURE_DEFS = $(if $(filter 1,$(SYSTEMD)),-DENABLE_SYSTEMD) \
 # compiles every TU in a single command.
 DEPFLAGS = -MMD -MP
 
-# BearSSL. The dev build links the host picolibc lib (built with the same `cc`
+# BearSSL. The dev build links the x86_64 lib (built with the same `cc`
 # and -flto, so the LTO link works); the aarch64 one is built by build.sh.
 BEARSSL_INC ?= build/deps/bearssl/bearssl-0.6/inc
-BEARSSL_LIB ?= build/deps/bearssl/lib-x86_64-picolibc/libbearssl.a
+BEARSSL_LIB ?= build/deps/bearssl/lib-x86_64/libbearssl.a
 
-# Host picolibc install (x86_64-linux). Produced by `tools/deps.sh picolibc`.
-PICO_ROOT ?= build/deps/picolibc-gnu/usr/local/picolibc/x86_64-linux
-PICO_INC   = $(PICO_ROOT)/include/none
-PICO_LIB   = $(PICO_ROOT)/lib/none
-PICO_CRT   = $(PICO_LIB)/crt0-linux.o
-PICO_LD    = $(PICO_LIB)/picolibc_linux.ld
-PICO_LIBC  = $(PICO_LIB)/libc.a
+# Static freestanding link line, shared by the service and the
+# service-shaped test binaries (run_tests is an ordinary glibc binary; see
+# below). src/start.c provides _start/environ/exit, src/freestand.c the
+# syscall wrappers and libc ops, src/alloc.c the heap, src/pico.ld the
+# layout idle.c's evictions read back at runtime.
+FS_OBJS = src/start.o src/freestand.o src/alloc.o
 
-# Static picolibc link line, shared by the service and the test binaries.
-# -nostdlib/-nostartfiles because crt0-linux.o and libc/liblinux are given
-# explicitly; the socket layer is shimmed by -Isrv + src/linux_sock.c.
-PICO_LINK  = -s -Wl,--gc-sections \
-             $(PICO_CRT) \
-             -Wl,--start-group $(PICO_LIB)/libc.a $(PICO_LIB)/liblinux.a \
-             -Wl,--end-group \
-             -Wl,--build-id=none -Wl,-z,max-page-size=0x1000 -Wl,-T $(PICO_LD) \
-             -lgcc -nostdlib -nostartfiles -static -no-pie
+STATIC_LINK = -s -Wl,--gc-sections \
+              -Wl,--build-id=none -Wl,-z,max-page-size=0x1000 \
+              -Wl,-T,src/pico.ld \
+              -lgcc -nostdlib -nostartfiles -static -no-pie
 
 SRCS = src/pico_exporter.c src/push.c src/otlp.c src/collectors.c src/fmt.c \
        src/arena.c src/dns.c src/linux_sock.c src/bearglue.c \
-       src/pdir.c src/idle.c
+       src/pdir.c src/idle.c src/start.c src/freestand.c src/alloc.c
 OBJS = $(SRCS:.c=.o)
 
 BIN = bin/pico_exporter
@@ -133,18 +138,16 @@ TESTBIN = build/tests
 
 all: $(BIN)
 
-$(BIN): $(OBJS) $(BEARSSL_LIB) $(PICO_LIBC)
+$(BIN): $(OBJS) $(BEARSSL_LIB) src/pico.ld
 	@mkdir -p bin
-	$(CC) $(CFLAGS) $(OBJS) $(BEARSSL_LIB) $(PICO_LINK) -o $@
+	$(CC) $(CFLAGS) $(OBJS) $(BEARSSL_LIB) $(STATIC_LINK) -o $@
 
 # Deps must exist before any TU compiles: BearSSL headers (the lib rule also
-# builds the source) and picolibc's headers under $(PICO_INC).
+# builds the source).
 $(BEARSSL_LIB):
 	@bash tools/deps.sh bearssl-host
-$(PICO_LIBC):
-	@bash tools/deps.sh picolibc
 
-$(OBJS): | $(BEARSSL_LIB) $(PICO_LIBC)
+$(OBJS): | $(BEARSSL_LIB)
 
 ifneq ($(TA_BUNDLE),)
 src/bearglue.o: $(TA_HDR)
@@ -170,12 +173,17 @@ $(OBJS) $(TESTBIN)/run_tests $(TESTBIN)/pico_exporter-capped: $(FLAGS_STAMP)
 
 # Custom CA builds must not leak into the harness: its TLS cases assert
 # wrong-anchor rejection against the production DigiCert anchor, so the harness
-# always compiles with the default anchor set regardless of CAFILE.
-TEST_CFLAGS = $(filter-out $(TA_DEF),$(CFLAGS))
+# always compiles with the default anchor set regardless of CAFILE. It is also
+# an ordinary glibc binary (PIE, libc's TLS canary), so the x86-only global
+# guard flag leaves with it -- on a glibc link there is no __stack_chk_guard
+# global to read. The freestanding test builds keep the full $(CFLAGS).
+TEST_CFLAGS = $(filter-out -mstack-protector-guard=global $(TA_DEF),$(CFLAGS))
 
 # One harness binary for all the connection/encode checks (TLS, wrong-anchor,
 # oversized-record recovery, keepalive, OTLP round-trip). See tests/run_tests.c.
-# Under picolibc the socket shim (src/linux_sock.c) is part of the link.
+# The harness is an ordinary glibc binary (full stdio, strtod, qsort...), so
+# unlike the service builds it links libc normally and defines nothing from
+# src/freestand.c/start.c/alloc.c.
 test-bin: $(TESTBIN)/run_tests $(TESTBIN)/pico_exporter-capped \
 	$(TESTBIN)/pico_exporter-systemd
 
@@ -185,41 +193,50 @@ $(TESTBIN)/run_tests: INSECURE = 0
 
 $(TESTBIN)/run_tests: tests/run_tests.c src/push.c src/dns.c src/otlp.c \
 	src/arena.c src/linux_sock.c src/bearglue.c src/fmt.c \
-	tests/bearssl_ta_isrg_x1.h $(BEARSSL_LIB) $(PICO_LIBC)
+	tests/bearssl_ta_isrg_x1.h $(BEARSSL_LIB)
 	@mkdir -p $(TESTBIN)
-	$(CC) $(TEST_CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE -D__picolibc__ \
-		-Itests -I$(PICO_INC) -I$(BEARSSL_INC) \
+	$(CC) $(TEST_CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE \
+		-Itests -I$(BEARSSL_INC) \
 		tests/run_tests.c src/push.c src/dns.c src/otlp.c src/arena.c \
-		src/linux_sock.c src/bearglue.c src/fmt.c $(BEARSSL_LIB) $(PICO_LINK) -o $@
+		src/linux_sock.c src/bearglue.c src/fmt.c $(BEARSSL_LIB) -o $@
 
 # Low-cap build for the self-report test: the sample cap is unreachable on a
 # normal host, so the only way to check that a hit cap is reported rather than
 # swallowed is to build one where it is reachable. Compile it without systemd so
 # the count is deterministic on any host (systemd adds ~120 host-dependent
 # series that could push past the 120 cap), and without the insecure flag.
+# Service-shaped (freestanding). The runtime objects are flavor-independent
+# (no feature define touches them), so the prebuilt $(FS_OBJS) link in.
 capped: $(TESTBIN)/pico_exporter-capped
 $(TESTBIN)/pico_exporter-capped: SYSTEMD = 0
 $(TESTBIN)/pico_exporter-capped: INSECURE = 0
-$(TESTBIN)/pico_exporter-capped: $(SRCS) $(BEARSSL_LIB) $(PICO_LIBC)
+$(TESTBIN)/pico_exporter-capped: $(SRCS) $(FS_OBJS) $(BEARSSL_LIB) src/pico.ld
 	@mkdir -p $(TESTBIN)
-	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE -D__picolibc__ \
-		-I$(PICO_INC) -I$(BEARSSL_INC) \
-		-DCOLLECT_MAX_SAMPLES=120 $(SRCS) $(BEARSSL_LIB) $(PICO_LINK) \
-		-o $@
+	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE -D__PICO_FREESTAND__ \
+		-I$(BEARSSL_INC) -DCOLLECT_MAX_SAMPLES=120 \
+		src/pico_exporter.c src/push.c src/otlp.c src/collectors.c src/fmt.c \
+		src/arena.c src/dns.c src/linux_sock.c src/bearglue.c src/pdir.c \
+		src/idle.c $(FS_OBJS) $(BEARSSL_LIB) $(STATIC_LINK) -o $@
 
 # systemd-enabled build for the node_systemd_units assertions. SYSTEMD is off in
 # the default build, so without this binary the collector would ship untested.
+# Service-shaped (freestanding): this is where the fork/exec popen_sh/pclose_sh
+# path runs, and the line reader that replaced fgets.
 $(TESTBIN)/pico_exporter-systemd: SYSTEMD = 1
 $(TESTBIN)/pico_exporter-systemd: INSECURE = 0
-$(TESTBIN)/pico_exporter-systemd: $(SRCS) $(BEARSSL_LIB) $(PICO_LIBC)
+$(TESTBIN)/pico_exporter-systemd: $(SRCS) $(FS_OBJS) $(BEARSSL_LIB) src/pico.ld
 	@mkdir -p $(TESTBIN)
-	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE -D__picolibc__ \
-		-I$(PICO_INC) -I$(BEARSSL_INC) \
-		$(SRCS) $(BEARSSL_LIB) $(PICO_LINK) -o $@
+	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE -D__PICO_FREESTAND__ \
+		-I$(BEARSSL_INC) \
+		src/pico_exporter.c src/push.c src/otlp.c src/collectors.c src/fmt.c \
+		src/arena.c src/dns.c src/linux_sock.c src/bearglue.c src/pdir.c \
+		src/idle.c $(FS_OBJS) $(BEARSSL_LIB) $(STATIC_LINK) -o $@
 
 %.o: %.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) $(DEPFLAGS) -D_GNU_SOURCE -D__picolibc__ \
-		-I$(PICO_INC) -I$(BEARSSL_INC) -c $< -o $@
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(FS_CFLAGS) $(DEPFLAGS) -D_GNU_SOURCE \
+		-D__PICO_FREESTAND__ -I$(BEARSSL_INC) -c $< -o $@
+
+src/start.o src/freestand.o src/alloc.o: FS_CFLAGS = $(FS_FLAGS)
 
 -include $(OBJS:.o=.d)
 
@@ -233,7 +250,7 @@ debug: $(BIN)
 # `make distclean` to drop it.
 clean:
 	rm -f $(OBJS) $(OBJS:.o=.d)
-	rm -f $(BIN) bin/pico_exporter-picolibc-aarch64 $(FLAGS_STAMP)
+	rm -f $(BIN) bin/pico_exporter-aarch64 $(FLAGS_STAMP)
 	rm -rf $(TESTBIN)
 	rm -rf tests/.fake tests/.fake_big tests/.M.txt tests/.capped.log \
 		tests/.metrics.log tests/.sink.bin \
@@ -249,17 +266,15 @@ distclean: clean
 # Self-bootstrap the build dependencies into build/deps/ (one-time downloads).
 deps:
 	@bash tools/deps.sh bearssl-host
-	@bash tools/deps.sh picolibc
-	@bash tools/deps.sh bearssl-pico
+	@bash tools/deps.sh bearssl-aarch64
 
 # Host-prerequisite preflight: names missing tools with install hints instead
 # of failing mid-fetch. See tools/doctor.sh.
 doctor:
 	bash tools/doctor.sh
 
-# Static deployables (x86_64 dev + aarch64). The picolibc toolchains
-# self-bootstrap into build/deps/ (bearssl_env.sh pins every tarball by
-# sha256); picolibc defaults to the repo-local install.
+# Static deployables (x86_64 dev + aarch64). BearSSL self-bootstraps into
+# build/deps/ (bearssl_env.sh pins the tarball by sha256).
 aarch64:
 	bash build.sh
 

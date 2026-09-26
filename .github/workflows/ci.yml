@@ -16,7 +16,7 @@ jobs:
       - name: Install toolchain prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build gcc-aarch64-linux-gnu
+          sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
 
       - name: Cache build dependencies
         uses: actions/cache@v4
@@ -36,7 +36,7 @@ jobs:
           name: pico_exporter-binaries
           path: |
             bin/pico_exporter
-            bin/pico_exporter-picolibc-aarch64
+            bin/pico_exporter-aarch64
 
       - name: Run full test gate
         run: make test

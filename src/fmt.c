@@ -6,9 +6,10 @@
  * expansion of v (finite for any binary64) and the round-trip test is an
  * exact compare against the round-to-nearest interval [lo, hi] of v.
  * fmt_f64_parse() is a correctly-rounded strtod over plain decimal
- * constants. Both were validated against host libc on ~2.6M values
- * (random bit patterns, powers of two +-1 ulp, metrics-like scalings) with
- * zero mismatches; run_tests fmt re-checks against picolibc on every run.
+ * constants. Both were validated against glibc on ~3.5M values (random bit
+ * patterns, powers of two +-1 ulp, metrics-like scalings) with zero
+ * mismatches; tests/run_tests fmt re-checks the sweep against the harness's
+ * own libc on every run.
  */
 
 #include "fmt.h"

@@ -1,6 +1,6 @@
 /* idle.c - evict everything dead until the next cycle, then sleep.
  *
- * Raw syscalls on purpose: a call into picolibc's madvise()/nanosleep() would
+ * Raw syscalls on purpose: a call into libc's madvise()/nanosleep() would
  * keep their text pages resident through the sleep. With everything inlined
  * here, the only code page left resident while the process sleeps is this one.
  */
@@ -19,14 +19,15 @@
 #define PFLOOR(a) ((uintptr_t)(a) & ~(PAGE - 1))
 #define PCEIL(a)  (((uintptr_t)(a) + PAGE - 1) & ~(PAGE - 1))
 
-/* From picolibc_linux.ld: the text segment is .init then .text, closed by
+/* From src/pico.ld: the text segment is .init then .text, closed by
    etext; _pid_base is ADDR(.rodata); the first byte the program ever writes
-   is the lower of __tls_space (errno) and __data_start. Everything below that
-   byte in the RW segment is clean file data and safe to drop.
-   The script exports no symbol for the segment's first byte. On x86_64 crt0
-   places _start in plain .text, sorted after main, so _start is not reliably
-   the segment start; the marker is: an empty .init.* input section, KEEP'd
-   and first in the segment. */
+   is min(__tls_space, __data_start) -- pico.ld makes both ADDR(.data), since
+   the binary has no TLS at all. Everything below that byte in the RW segment
+   is clean file data and safe to drop.
+   The script exports no symbol for the segment's first byte. The marker is:
+   an empty .init.* input section, KEEP'd and first in the segment
+   (start.c's _start lives in .init.start, which sorts after .init.idle, so
+   the bootstrap is inside the drop range too). */
 __asm__(".pushsection .init.idle,\"ax\"\n"
         ".globl idle_text_lo\n"
         "idle_text_lo:\n"

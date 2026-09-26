@@ -11,7 +11,6 @@
 
 #define _POSIX_C_SOURCE 200809L
 
-#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/utsname.h>
@@ -22,6 +21,7 @@
 #include "bearglue.h"
 #include "collectors.h"
 #include "fmt.h"
+#include "freestand.h"
 #include "idle.h"
 #include "otlp.h"
 #include "push.h"
@@ -286,8 +286,9 @@ static void push_loop(const struct rw_url *u, const char *auth,
 
 int main(int argc, char **argv) {
     /* A write on a server-closed keep-alive socket must not kill the cycle;
-       the push layer turns it into a reconnect. */
-    signal(SIGPIPE, SIG_IGN);
+       the push layer turns it into a reconnect. Blocking (not SIG_IGN-ing) is
+       the freestanding equivalent: the write then returns EPIPE. */
+    fs_ignore_sigpipe();
 
     const char *rootfs = "/";
     bool dump_once = false;

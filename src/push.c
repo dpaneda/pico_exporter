@@ -24,9 +24,9 @@
 #include "fmt.h"
 #include "push.h"
 
-/* strerror() would drag in picolibc's full 1,152 B errnames table for this one
-   message. These are the failures the connect path actually produces; anything
-   else still reports its number. */
+/* strerror() would drag in a whole 1 kB+ errnames table for this one message.
+   These are the failures the connect path actually produces; anything else
+   still reports its number. */
 static const char *errno_name(int e) {
     switch (e) {
     case ECONNREFUSED: return "connection refused";

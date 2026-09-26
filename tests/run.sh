@@ -23,6 +23,9 @@ fi
 # with MADV_DONTNEED. A written page there would silently revert to the file
 # image, so no writable section other than .data.rel.ro may intersect it, and
 # .data.rel.ro is only clean because a static non-PIE link has no relocations.
+# There is no TLS in the freestanding binary (no .tdata/.tbss/.tls_space
+# sections), so the min-marker falls back to .data, which is what pico.ld's
+# __tls_space PROVIDE says too.
 layout_check() { # layout_check <bin> <readelf>
   local bin="$1" re="$2" out
   if ! "$re" -rW "$bin" | grep -q "There are no relocations in this file"; then
@@ -67,7 +70,7 @@ if command -v readelf >/dev/null; then
 else
   echo "SKIP: layout invariant ($BIN): readelf not found"
 fi
-A64="$DIR/bin/pico_exporter-picolibc-aarch64"
+A64="$DIR/bin/pico_exporter-aarch64"
 if [ -f "$A64" ]; then
   if command -v aarch64-linux-gnu-readelf >/dev/null; then
     layout_check "$A64" aarch64-linux-gnu-readelf
@@ -388,7 +391,7 @@ fi
 if [ -x "$HARNESS" ]; then
   FMOUT="$("$HARNESS" fmt 2>&1)"
   if echo "$FMOUT" | grep -q 'fmt: OK'; then
-    echo "PASS: fmt layer ($(echo "$FMOUT" | grep -ao '[0-9]* values' | cut -d' ' -f1) values vs picolibc printf/strtod)"
+    echo "PASS: fmt layer ($(echo "$FMOUT" | grep -ao '[0-9]* values' | cut -d' ' -f1) values vs glibc printf/strtod)"
   else
     echo "FAIL: fmt layer"; echo "$FMOUT"; fail=1
   fi
@@ -513,7 +516,7 @@ if command -v python3 >/dev/null 2>&1; then
     if [ "${HEAPS:-0}" -eq 0 ]; then
       echo "PASS: no [heap] mapping"
     else
-      echo "FAIL: [heap] mapping present (picolibc malloc was called)"
+      echo "FAIL: [heap] mapping present (malloc ran in a push mode steady state)"
       fail=1
     fi
     # Two INTERVAL=2 cycles fit in the ~4.4 s window; 16 per cycle measured

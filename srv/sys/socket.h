@@ -1,4 +1,7 @@
-/* Minimal POSIX socket types/syscalls for picolibc linux (aarch64). */
+/* Minimal POSIX socket types/constants, shadowing the host header on every
+   link. The code only touches the subset declared here (IPv4, blocking
+   TCP/UDP, SO_RCVTIMEO); the syscalls themselves live in src/linux_sock.c
+   on the freestanding links and in libc under the glibc harness build. */
 #ifndef _SYS_SOCKET_H_
 #define _SYS_SOCKET_H_
 

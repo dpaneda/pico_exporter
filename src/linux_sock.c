@@ -1,11 +1,12 @@
-/* linux_sock.c - Linux socket syscalls for picolibc (aarch64 + x86_64).
+/* linux_sock.c - Linux socket syscalls on the freestanding link (aarch64 +
+   x86_64).
  *
- * picolibc's linux port (libos/linux) exposes raw syscall() but ships no
- * socket wrappers or <sys/socket.h>; this file fills that gap so the push
- * path and src/dns.c can talk to the network. Compiles to an empty object
- * on glibc/musl where libc already provides these.
+ * The service is linked -nostdlib, so the few network syscalls the push path
+ * and src/dns.c need go through raw syscall()s here. Compiles to an empty
+ * object on the glibc test-harness build, which links libc's own socket
+ * wrappers instead.
  */
-#ifdef __picolibc__
+#ifdef __PICO_FREESTAND__
 
 #include <errno.h>
 #include <stdint.h>
@@ -29,7 +30,7 @@ long syscall(long num, ...);
 #define __LINUX_SYS_setsockopt 54
 #define __LINUX_SYS_uname      63 /* x86_64 uname (sys_newuname, 390-byte struct) */
 #else
-#error "linux_sock.c: picolibc socket shims support aarch64 and x86_64 only"
+#error "linux_sock.c: socket shims support aarch64 and x86_64 only"
 #endif
 
 int socket(int domain, int type, int protocol)
@@ -76,11 +77,4 @@ long sysconf(int name)
     return -1;
 }
 
-/* glibc-style errno accessor so objects built against musl/glibc (BearSSL)
- * resolve their errno to picolibc's TLS errno slot. */
-int *__errno_location(void)
-{
-    return &errno;
-}
-
-#endif /* __picolibc__ */
+#endif /* __PICO_FREESTAND__ */

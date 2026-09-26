@@ -2,8 +2,8 @@
  *
  * One UDP query against the first nameserver parsed from /etc/resolv.conf,
  * then a fallback query against a configured secondary. No CNAME chasing:
- * the first A record in the answer section wins. Sized for the picolibc
- * deployable (~1.5 KB .text), so it avoids <stdio.h> and libc DNS.
+ * the first A record in the answer section wins. ~1.5 KB of .text, so it
+ * avoids <stdio.h> and the libc DNS stack.
  */
 #include <errno.h>
 #include <fcntl.h>
