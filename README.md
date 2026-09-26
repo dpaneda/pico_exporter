@@ -70,8 +70,8 @@ chmod +x pico_exporter
 2.  Point it at a gateway and run:
 
 ```sh
-GW_URL=https://otlp-gateway-prod/otlp/v1/metrics \
-GW_USER=12345 GW_PASS=glc_... \
+GW_URL=https://your-otlp-gateway/otlp/v1/metrics \
+GW_USER=your-user GW_PASS=your-password \
 ./pico_exporter
 ```
 
@@ -84,13 +84,23 @@ Configuration is environment-based:
 
 | Env | Required | Default | Meaning |
 |---|---|---|---|
-| `GW_URL` | yes (push mode) | none | push endpoint, `https://host[:port]/path` or `http://…` |
+| `GW_URL` | yes | none | push endpoint, `https://host[:port]/path` or `http://…` |
 | `GW_USER` / `GW_PASS` | no | empty | HTTP Basic-auth (Grafana Cloud: stack id / `glc_…`) |
 | `JOB` | no | `integrations/node_exporter` | OTel `service.name` → Prometheus `job` |
 | `INSTANCE` | no | `uname -n` | OTel `service.instance.id` → Prometheus `instance`. Set it when two exporters share a host so they do not collide into one series |
 | `INTERVAL` | no | `15` | collection/push cycle in seconds |
 | `BATCH` | no | `100` | samples per OTLP request |
 | `TEXTFILE_DIR` | no | unset | directory of `*.prom` files to fold into each push; unset disables the collector |
+
+| Env | Required | Default | Meaning |
+|---|---|---|---|
+| `GW_URL` | yes | none | Push endpoint, `https://host[:port]/path` or `http://…` |
+| `GW_USER` / `GW_PASS` | no | empty | HTTP Basic Auth credentials (Grafana Cloud: stack ID / `glc_…`) |
+| `JOB` | no | `integrations/node_exporter` | OTel `service.name` → Prometheus `job` |
+| `INSTANCE` | no | `uname -n` | OTel `service.instance.id` → Prometheus `instance`. Set it when two exporters share a host so they do not collide into one series |
+| `INTERVAL` | no | `15` | Collection/push cycle in seconds |
+| `BATCH` | no | `100` | Samples per OTLP request |
+| `TEXTFILE_DIR` | no | unset | Directory of `*.prom` files to fold into each push; unset disables the collector |
 
 ## 📦 Deploy
 
