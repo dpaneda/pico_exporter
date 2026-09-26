@@ -7,7 +7,12 @@
  *   - diskstats/dsk: 512-byte sectors -> *512
  *   - meminfo: kB -> *1024, parens in key become underscores
  *   - fs: only /dev-based devices and overlay, statvfs-walked at rootfs mountpoint
- *   - net: sysfs statistics per device, grouped by metric when emitted */
+ *   - net: sysfs statistics per device, grouped by metric when emitted
+ *
+ * No stdio (issue #2): values reach the sink as tagged mvals -- doubles in
+ * push mode, rendered per kind only in the one-shot text modes. Names,
+ * labels and paths are built with the fmt appends.
+ */
 
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE 1
@@ -15,7 +20,6 @@
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -27,36 +31,77 @@
 #include <unistd.h>
 
 #include "collectors.h"
+#include "fmt.h"
 #include "pdir.h"
+
+#ifdef ENABLE_SYSTEMD
+#include <stdio.h>   /* popen/fgets/pclose: the systemd flavor only */
+#endif
 
 static double clk_tick;
 
-/* --- helper: path with optional rootfs --- */
-static void make_path(char *path, size_t sz, const char *rootfs, const char *rel) {
-    if (rootfs[0]) snprintf(path, sz, "%s/%s", rootfs, rel);
-    else snprintf(path, sz, "/%s", rel);
+/* --- mval constructors --- */
+static mval mv_str(const char *s) {
+    mval v = { MV_STR, { .s = s } };
+    return v;
+}
+static mval mv_int(long long i) {
+    mval v = { MV_INT, { .i = i } };
+    return v;
+}
+static mval mv_uint(unsigned long long u) {
+    mval v = { MV_UINT, { .u = u } };
+    return v;
+}
+static mval mv_dbl(double d) {
+    mval v = { MV_DBL, { .d = d } };
+    return v;
 }
 
-#define STAT_BUF 4096
+/* --- helper: string builder (the snprintf replacement) --- */
+struct sb {
+    char *buf;
+    size_t cap, n;
+    int trunc;
+};
 
-/* Every path built here is <rootfs> plus a short /proc or /sys suffix. One cap
-   for all of them ends the "grow the buffer until -Wformat-truncation goes
-   quiet" cascade that had hbase[2600] feeding cdir[2900] feeding fname[3400];
-   512 leaves ~470 bytes for the --path.rootfs prefix. */
-#define PATH_CAP 512
+static void sb_init(struct sb *b, char *buf, size_t cap) {
+    b->buf = buf;
+    b->cap = cap;
+    b->n = 0;
+    b->trunc = 0;
+    buf[0] = 0;
+}
 
-/* snprintf into a PATH_CAP buffer; non-zero when the path would have been
-   truncated, so the caller skips the entry rather than reading a wrong path.
-   Using the return value is also what keeps -Wformat-truncation quiet without
-   inflating the buffer. */
-#define PATH_FMT(buf, ...) (snprintf((buf), PATH_CAP, __VA_ARGS__) >= PATH_CAP)
+static void sb_mem(struct sb *b, const char *s, size_t n) {
+    if (b->n + n + 1 > b->cap) {
+        size_t room = b->cap - b->n - 1;
+        if (n > room) {
+            b->trunc = 1;
+            n = room;
+        }
+    }
+    memcpy(b->buf + b->n, s, n);
+    b->n += n;
+    b->buf[b->n] = 0;
+}
 
-/* Copies a kernel object name (interface, block device) into a fixed field.
-   Non-zero when it did not fit, so the caller drops the entry instead of
-   labelling a metric with a truncated name. IFNAMSIZ is 16 and
-   BDEVNAME_SIZE is 32, so the fields are sized to the kernel's own limits. */
-#define NAME_CPY(dst, src) \
-    ((size_t)snprintf((dst), sizeof (dst), "%s", (src)) >= sizeof (dst))
+static void sb_str(struct sb *b, const char *s) {
+    sb_mem(b, s, strlen(s));
+}
+
+/* --- helper: path with optional rootfs --- */
+static void make_path(char *path, size_t sz, const char *rootfs, const char *rel) {
+    struct sb b;
+    sb_init(&b, path, sz);
+    if (rootfs[0]) {
+        sb_str(&b, rootfs);
+        sb_str(&b, "/");
+    } else {
+        sb_str(&b, "/");
+    }
+    sb_str(&b, rel);
+}
 
 /* Shared read buffer for the /proc and /sys files. The collectors run
    sequentially from collect_all, single-threaded, and none holds a pointer into
@@ -75,7 +120,7 @@ static void make_path(char *path, size_t sz, const char *rootfs, const char *rel
 static struct arena *g_rar;      /* cycle arena, NULL in the one-shot modes */
 static char   *g_rbuf;
 static size_t  g_rcap;
-static size_t  g_rhint = STAT_BUF;   /* survives the reset: see rbuf_cycle_end */
+static size_t  g_rhint = 4096;   /* survives the reset: see rbuf_cycle_end */
 static char   *g_rheap;          /* sticky malloc fallback, process-lifetime */
 
 void collectors_set_arena(struct arena *ar) { g_rar = ar; }
@@ -144,9 +189,9 @@ static long read_abs(const char *path, char *buf, size_t cap) {
    Reading to EOF instead of a fixed cap is what keeps the metrics correct on a
    host whose tables are larger than this one's. */
 static const char *read_proc(const char *rootfs, const char *rel) {
-    char path[PATH_CAP];
+    char path[512];
     make_path(path, sizeof path, rootfs, rel);
-    if (rbuf_reserve(STAT_BUF) != 0) return NULL;
+    if (rbuf_reserve(4096) != 0) return NULL;
     g_rbuf[0] = 0;
     int fd = open(path, O_RDONLY);
     if (fd < 0) return g_rbuf;
@@ -184,21 +229,48 @@ static bool contains(const char *hay, const char *needle) {
     return strstr(hay, needle) != NULL;
 }
 
-/* splitWhitespace() into at most max tokens. Returns token count. */
+/* Tokenizer over " \t\r\n" (the strtok_r replacement): splits in place. */
 static int split_ws(char *line, char **toks, int max) {
     int n = 0;
-    char *save;
-    for (char *t = strtok_r(line, " \t\r\n", &save); t && n < max;
-         t = strtok_r(NULL, " \t\r\n", &save))
-        toks[n++] = t;
+    char *p = line;
+    while (*p && n < max) {
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        if (!*p) break;
+        toks[n++] = p;
+        while (*p && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n') p++;
+        if (*p) *p++ = 0;
+    }
     return n;
 }
 
-static void fmt_float(char out[40], double v) {
-    for (int prec = 1; prec <= 17; prec++) {
-        snprintf(out, 40, "%.*g", prec, v);
-        if (strtod(out, NULL) == v) return;
+/* strtoll-shaped integer parse over a token (leading blanks, optional
+ * sign, digits up to the first non-digit). */
+static long long parse_ll(const char *s) {
+    while (*s == ' ' || *s == '\t') s++;
+    int neg = 0;
+    if (*s == '-') { neg = 1; s++; }
+    else if (*s == '+') s++;
+    unsigned long long v = 0;
+    while (*s >= '0' && *s <= '9') {
+        v = v * 10 + (unsigned long long)(*s - '0');
+        s++;
     }
+    return neg ? -(long long)v : (long long)v;
+}
+
+/* Hex token parse (socket addresses in /proc/net/udp). */
+static unsigned long long parse_hex(const char *s) {
+    unsigned long long v = 0;
+    while (*s) {
+        int d;
+        if (*s >= '0' && *s <= '9') d = *s - '0';
+        else if (*s >= 'a' && *s <= 'f') d = *s - 'a' + 10;
+        else if (*s >= 'A' && *s <= 'F') d = *s - 'A' + 10;
+        else break;
+        v = v * 16 + (unsigned long long)d;
+        s++;
+    }
+    return v;
 }
 
 /* ---------- metrics sink ---------- */
@@ -252,8 +324,12 @@ static void samp_grow(struct metrics *m) {
             na = malloc(ncap * sizeof *na);
             if (!na) return;            /* scap unchanged; caller must recheck */
             heap = true;
-            fprintf(stderr, "WARN samp_grow: arena exhausted, malloc %zu\n",
-                    ncap * sizeof *na);
+            char msg[96];
+            char *o = msg;
+            fmt_str_append(&o, "WARN samp_grow: arena exhausted, malloc ");
+            fmt_u64_append(&o, ncap * sizeof *na);
+            fmt_str_append(&o, "\n");
+            write(2, msg, (size_t)(o - msg));
             if (m->samples) memcpy(na, m->samples, m->n * sizeof *m->samples);
         }
         if (m->heap_samples) free(m->samples);
@@ -371,8 +447,9 @@ static int parse_labels(struct metrics *m, const char *labels,
 }
 
 void metrics_line(struct metrics *m, const char *name, const char *labels,
-                  const char *value) {
+                  mval v) {
     if (m->text_mode) {
+        char buf[40];
         txt_add(m, name, strlen(name));
         if (labels[0]) {
             txt_add(m, "{", 1);
@@ -380,12 +457,37 @@ void metrics_line(struct metrics *m, const char *name, const char *labels,
             txt_add(m, "}", 1);
         }
         txt_add(m, " ", 1);
-        txt_add(m, value, strlen(value));
+        switch (v.kind) {
+        case MV_STR:
+            txt_add(m, v.v.s, strlen(v.v.s));
+            break;
+        case MV_INT:
+            txt_add(m, buf, (size_t)fmt_i64(buf, v.v.i));
+            break;
+        case MV_UINT:
+            txt_add(m, buf, (size_t)fmt_u64(buf, v.v.u));
+            break;
+        case MV_DBL:
+            fmt_f64_shortest(buf, v.v.d);
+            txt_add(m, buf, strlen(buf));
+            break;
+        }
         txt_add(m, "\n", 1);
     } else {
-        char *end = NULL;
-        double v = strtod(value, &end);
-        if (end == value || (end && *end)) return;
+        double value;
+        if (v.kind == MV_STR) {
+            const char *end = v.v.s + strlen(v.v.s);
+            double d;
+            size_t used = fmt_f64_parse(v.v.s, &d);
+            if (used == 0 || v.v.s + used != end) return;
+            value = d;
+        } else if (v.kind == MV_INT) {
+            value = (double)v.v.i;
+        } else if (v.kind == MV_UINT) {
+            value = (double)v.v.u;
+        } else {
+            value = v.v.d;
+        }
         if (m->n >= COLLECT_MAX_SAMPLES - COLLECT_RESERVED_SAMPLES) {
             m->ndropped++;
             return;
@@ -410,7 +512,7 @@ void metrics_line(struct metrics *m, const char *name, const char *labels,
             s->labels = lv;
             s->nlabels = nl;
         }
-        s->value = v;
+        s->value = value;
         m->n++;
     }
 }
@@ -439,11 +541,15 @@ static double now_seconds(void) {
 }
 
 static void scrape_done(struct metrics *m, const char *collector, double t0) {
-    char d[40], label[80];
-    fmt_float(d, now_seconds() - t0);
-    snprintf(label, sizeof label, "collector=\"%s\"", collector);
-    metrics_line(m, "node_scrape_collector_duration_seconds", label, d);
-    metrics_line(m, "node_scrape_collector_success", label, "1");
+    char label[80];
+    struct sb b;
+    sb_init(&b, label, sizeof label);
+    sb_str(&b, "collector=\"");
+    sb_str(&b, collector);
+    sb_str(&b, "\"");
+    metrics_line(m, "node_scrape_collector_duration_seconds", label,
+                 mv_dbl(now_seconds() - t0));
+    metrics_line(m, "node_scrape_collector_success", label, mv_int(1));
 }
 
 /* Run body exactly once, then emit duration+success. */
@@ -453,7 +559,7 @@ static void scrape_done(struct metrics *m, const char *collector, double t0) {
 
 static void collect_build(struct metrics *m) {
     metrics_line(m, "node_exporter_build_info",
-                 "version=\"1.1.0\",cversion=\"0.1.0\"", "1");
+                 "version=\"1.1.0\",cversion=\"0.1.0\"", mv_int(1));
 }
 
 static void collect_rss(struct metrics *m) {
@@ -463,13 +569,10 @@ static void collect_rss(struct metrics *m) {
         char *nl = strchr(p, '\n');
         if (nl) *nl = 0;
         if (has_prefix(p, "VmRSS:")) {
-            long rss = 0;
             const char *sp = p + 6;
             while (*sp == ' ' || *sp == '\t') sp++;
-            rss = atol(sp) * 1024;
-            char val[40];
-            snprintf(val, sizeof val, "%ld", rss);
-            metrics_line(m, "node_exporter_resident_memory_bytes", "", val);
+            metrics_line(m, "node_exporter_resident_memory_bytes", "",
+                         mv_int(parse_ll(sp) * 1024));
             break;
         }
         if (!nl) break;
@@ -481,13 +584,20 @@ static void collect_uname(struct metrics *m) {
     struct utsname uts;
     if (uname(&uts) != 0) return;
     char labels[1024];
-    char val[40];
-    snprintf(labels, sizeof labels,
-             "machine=\"%s\",nodename=\"%s\",release=\"%s\",sysname=\"%s\","
-             "version=\"%s\"",
-             uts.machine, uts.nodename, uts.release, uts.sysname, uts.version);
-    snprintf(val, sizeof val, "1");
-    metrics_line(m, "node_uname_info", labels, val);
+    struct sb b;
+    sb_init(&b, labels, sizeof labels);
+    sb_str(&b, "machine=\"");
+    sb_str(&b, uts.machine);
+    sb_str(&b, "\",nodename=\"");
+    sb_str(&b, uts.nodename);
+    sb_str(&b, "\",release=\"");
+    sb_str(&b, uts.release);
+    sb_str(&b, "\",sysname=\"");
+    sb_str(&b, uts.sysname);
+    sb_str(&b, "\",version=\"");
+    sb_str(&b, uts.version);
+    sb_str(&b, "\"");
+    metrics_line(m, "node_uname_info", labels, mv_int(1));
 }
 
 static void collect_load(struct metrics *m) {
@@ -496,28 +606,27 @@ static void collect_load(struct metrics *m) {
     if (!buf) return;
     int n = split_ws(buf, toks, 8);
     if (n >= 3) {
-        metrics_line(m, "node_load1", "", toks[0]);
-        metrics_line(m, "node_load5", "", toks[1]);
-        metrics_line(m, "node_load15", "", toks[2]);
+        metrics_line(m, "node_load1", "", mv_str(toks[0]));
+        metrics_line(m, "node_load5", "", mv_str(toks[1]));
+        metrics_line(m, "node_load15", "", mv_str(toks[2]));
     }
 }
 
 static void collect_uptime(struct metrics *m) {
     struct timespec ts;
     if (clock_gettime(CLOCK_REALTIME, &ts) == 0) {
-        char vbuf[40];
-        fmt_float(vbuf, (double)ts.tv_sec + (double)ts.tv_nsec / 1e9);
-        metrics_line(m, "node_time_seconds", "", vbuf);
+        metrics_line(m, "node_time_seconds", "",
+                     mv_dbl((double)ts.tv_sec + (double)ts.tv_nsec / 1e9));
     }
 }
 
 static void collect_entropy(struct metrics *m) {
     const char *buf = read_proc(m->rootfs, "proc/sys/kernel/random/entropy_avail");
     if (buf && buf[0])
-        metrics_line(m, "node_entropy_available_bits", "", buf);
+        metrics_line(m, "node_entropy_available_bits", "", mv_str(buf));
     buf = read_proc(m->rootfs, "proc/sys/kernel/random/poolsize");
     if (buf && buf[0])
-        metrics_line(m, "node_entropy_pool_size_bits", "", buf);
+        metrics_line(m, "node_entropy_pool_size_bits", "", mv_str(buf));
 }
 
 static const char *mem_targets[] = {
@@ -543,12 +652,14 @@ static void collect_memory(struct metrics *m) {
             key[kl] = 0;
             for (int i = 0; i < ntarget; i++) {
                 if (strcmp(key, mem_targets[i]) == 0) {
-                    long long kb = strtoll(toks[1], NULL, 10);
-                    char metric[128], val[40];
-                    snprintf(metric, sizeof metric, "node_memory_%s_bytes",
-                             key);
-                    snprintf(val, sizeof val, "%lld", kb * 1024);
-                    metrics_line(m, metric, "", val);
+                    long long kb = parse_ll(toks[1]);
+                    char metric[128];
+                    struct sb b;
+                    sb_init(&b, metric, sizeof metric);
+                    sb_str(&b, "node_memory_");
+                    sb_str(&b, key);
+                    sb_str(&b, "_bytes");
+                    metrics_line(m, metric, "", mv_int(kb * 1024));
                     found++;
                     if (found == ntarget) return;
                     break;
@@ -575,27 +686,25 @@ static void collect_stat(struct metrics *m) {
         char *line = p;
         int n = split_ws(line, toks, 16);
         if (n >= 2) {
-            char vbuf[40];
             if (strcmp(toks[0], "cpu") == 0) {
                 if (n < 9) goto nextline;
                 for (int i = 0; i < 8; i++) {
-                    double d = strtod(toks[i + 1], NULL) / clk_tick;
-                    fmt_float(vbuf, d);
+                    double d = (double)parse_ll(toks[i + 1]) / clk_tick;
                     metrics_line(m, "node_cpu_seconds_total", modes[i],
-                                 vbuf);
+                                 mv_dbl(d));
                 }
             } else if (strcmp(toks[0], "intr") == 0) {
-                metrics_line(m, "node_intr_total", "", toks[1]);
+                metrics_line(m, "node_intr_total", "", mv_str(toks[1]));
             } else if (strcmp(toks[0], "ctxt") == 0) {
-                metrics_line(m, "node_context_switches_total", "", toks[1]);
+                metrics_line(m, "node_context_switches_total", "", mv_str(toks[1]));
             } else if (strcmp(toks[0], "btime") == 0) {
-                metrics_line(m, "node_boot_time_seconds", "", toks[1]);
+                metrics_line(m, "node_boot_time_seconds", "", mv_str(toks[1]));
             } else if (strcmp(toks[0], "processes") == 0) {
-                metrics_line(m, "node_forks_total", "", toks[1]);
+                metrics_line(m, "node_forks_total", "", mv_str(toks[1]));
             } else if (strcmp(toks[0], "procs_running") == 0) {
-                metrics_line(m, "node_procs_running", "", toks[1]);
+                metrics_line(m, "node_procs_running", "", mv_str(toks[1]));
             } else if (strcmp(toks[0], "procs_blocked") == 0) {
-                metrics_line(m, "node_procs_blocked", "", toks[1]);
+                metrics_line(m, "node_procs_blocked", "", mv_str(toks[1]));
             }
         }
     nextline:
@@ -608,7 +717,7 @@ static void collect_disk_bytes(struct metrics *m) {
     char *p = (char *)read_proc(m->rootfs, "proc/diskstats");
     if (!p) return;
     /* read+written bytes per device, emitted grouped by metric. */
-    struct devv { char dev[32]; char r[40], w[40]; };
+    struct devv { char dev[32]; long long r, w; };
     size_t dmax = count_lines(p);
     struct devv *devs = m_alloc(m, dmax * sizeof *devs);
     if (!devs) return;
@@ -624,24 +733,34 @@ static void collect_disk_bytes(struct metrics *m) {
                 ; /* skip */
             } else {
                 struct devv *d = &devs[nd++];
-                snprintf(d->dev, sizeof d->dev, "%s", dev);
-                snprintf(d->r, sizeof d->r, "%lld",
-                         strtoll(toks[5], NULL, 10) * 512);
-                snprintf(d->w, sizeof d->w, "%lld",
-                         strtoll(toks[9], NULL, 10) * 512);
+                size_t dl = strlen(dev);
+                if (dl >= sizeof d->dev) dl = sizeof d->dev - 1;
+                memcpy(d->dev, dev, dl);
+                d->dev[dl] = 0;
+                d->r = parse_ll(toks[5]) * 512;
+                d->w = parse_ll(toks[9]) * 512;
             }
         }
         if (!nl) break;
         p = nl + 1;
     }
-    char v[300], l[300];
     for (int i = 0; i < nd; i++) {
-        snprintf(l, sizeof l, "device=\"%.255s\"", devs[i].dev);
-        metrics_line(m, "node_disk_read_bytes_total", l, devs[i].r);
+        char l[300];
+        struct sb b;
+        sb_init(&b, l, sizeof l);
+        sb_str(&b, "device=\"");
+        sb_str(&b, devs[i].dev);
+        sb_str(&b, "\"");
+        metrics_line(m, "node_disk_read_bytes_total", l, mv_int(devs[i].r));
     }
     for (int i = 0; i < nd; i++) {
-        snprintf(v, sizeof v, "device=\"%.255s\"", devs[i].dev);
-        metrics_line(m, "node_disk_written_bytes_total", v, devs[i].w);
+        char l[300];
+        struct sb b;
+        sb_init(&b, l, sizeof l);
+        sb_str(&b, "device=\"");
+        sb_str(&b, devs[i].dev);
+        sb_str(&b, "\"");
+        metrics_line(m, "node_disk_written_bytes_total", l, mv_int(devs[i].w));
     }
 }
 
@@ -651,8 +770,8 @@ static void collect_filefd(struct metrics *m) {
     if (!buf) return;
     int n = split_ws(buf, toks, 8);
     if (n >= 3) {
-        metrics_line(m, "node_filefd_allocated", "", toks[0]);
-        metrics_line(m, "node_filefd_maximum", "", toks[2]);
+        metrics_line(m, "node_filefd_allocated", "", mv_str(toks[0]));
+        metrics_line(m, "node_filefd_maximum", "", mv_str(toks[2]));
     }
 }
 
@@ -666,7 +785,7 @@ static void collect_filesystem(struct metrics *m) {
        its full size in .bss on this one. */
     enum { FS_AVAIL = 0, FS_SIZE, FS_FREE, FS_FILES, FS_FILESFREE, FS_RO,
            FS_NVAL };
-    struct fsrow { char l[256]; char v[FS_NVAL][40]; };
+    struct fsrow { char l[256]; unsigned long long v[FS_NVAL]; };
     struct seenm { char mp[128]; };
     size_t fsmax = count_lines(p);
     struct fsrow *fsr = m_alloc(m, fsmax * sizeof *fsr);
@@ -695,12 +814,20 @@ static void collect_filesystem(struct metrics *m) {
             for (int i = 0; i < nseen; i++)
                 if (strcmp(seen[i].mp, mp) == 0) { dup = 1; break; }
             if (dup) goto next;
-            if ((size_t)nseen < fsmax)
-                snprintf(seen[nseen++].mp, sizeof seen[0].mp, "%s", mp);
+            if ((size_t)nseen < fsmax) {
+                size_t ml = strlen(mp);
+                if (ml >= sizeof seen[0].mp) ml = sizeof seen[0].mp - 1;
+                memcpy(seen[nseen].mp, mp, ml);
+                seen[nseen].mp[ml] = 0;
+                nseen++;
+            }
 
-            char full[PATH_CAP];
+            char full[512];
+            struct sb fb;
+            sb_init(&fb, full, sizeof full);
             if (m->rootfs[0]) {
-                if (PATH_FMT(full, "%s%s", m->rootfs, mp)) goto next;
+                sb_str(&fb, m->rootfs);
+                sb_str(&fb, mp);
                 /* collapse // */
                 char *out = full;
                 for (char *in = full; *in; in++) {
@@ -709,30 +836,31 @@ static void collect_filesystem(struct metrics *m) {
                 }
                 *out = 0;
             } else {
-                if (PATH_FMT(full, "%s", mp)) goto next;
+                sb_str(&fb, mp);
             }
             struct statvfs fs;
-            if (statvfs(full, &fs) != 0) goto next;
+            if (fb.trunc || statvfs(full, &fs) != 0) goto next;
             uint64_t bsize = fs.f_bsize;
             uint64_t total = fs.f_blocks * bsize;
             if (total == 0) goto next;
 
             if ((size_t)nfs < fsmax) {
                 struct fsrow *r = &fsr[nfs++];
-                size_t vz = sizeof r->v[0];
-                snprintf(r->l, sizeof r->l,
-                         "device=\"%s\",mountpoint=\"%s\",fstype=\"%s\"",
-                         dev, mp, fst);
-                snprintf(r->v[FS_AVAIL], vz, "%llu",
-                         (unsigned long long)(fs.f_bavail * bsize));
-                snprintf(r->v[FS_SIZE], vz, "%llu", (unsigned long long)total);
-                snprintf(r->v[FS_FREE], vz, "%llu",
-                         (unsigned long long)(fs.f_bfree * bsize));
-                snprintf(r->v[FS_FILES], vz, "%llu",
-                         (unsigned long long)fs.f_files);
-                snprintf(r->v[FS_FILESFREE], vz, "%llu",
-                         (unsigned long long)fs.f_ffree);
-                snprintf(r->v[FS_RO], vz, "%s", (fs.f_flag & 1) ? "1" : "0");
+                struct sb b;
+                sb_init(&b, r->l, sizeof r->l);
+                sb_str(&b, "device=\"");
+                sb_str(&b, dev);
+                sb_str(&b, "\",mountpoint=\"");
+                sb_str(&b, mp);
+                sb_str(&b, "\",fstype=\"");
+                sb_str(&b, fst);
+                sb_str(&b, "\"");
+                r->v[FS_AVAIL] = (uint64_t)fs.f_bavail * bsize;
+                r->v[FS_SIZE] = total;
+                r->v[FS_FREE] = (uint64_t)fs.f_bfree * bsize;
+                r->v[FS_FILES] = fs.f_files;
+                r->v[FS_FILESFREE] = fs.f_ffree;
+                r->v[FS_RO] = (fs.f_flag & 1) ? 1 : 0;
             }
         }
     next:
@@ -748,7 +876,7 @@ static void collect_filesystem(struct metrics *m) {
     };
     for (int k = 0; k < FS_NVAL; k++)
         for (int i = 0; i < nfs; i++)
-            metrics_line(m, fsnames[k], fsr[i].l, fsr[i].v[k]);
+            metrics_line(m, fsnames[k], fsr[i].l, mv_uint(fsr[i].v[k]));
 }
 
 struct nstat { const char *file, *suffix; const char *mtype; };
@@ -771,8 +899,9 @@ static void collect_network(struct metrics *m) {
        with the device name repeated once per statistic). Sized from a counting
        pass over the directory, so a host with more interfaces than the old
        fixed bound no longer loses them. */
-    struct nif { char dev[32]; char val[NET_NSTATS][40]; };
-    char base[PATH_CAP];
+    struct nif { char dev[32]; unsigned long long val[NET_NSTATS];
+                 char got[NET_NSTATS]; };
+    char base[512];
     if (m->rootfs[0])
         make_path(base, sizeof base, m->rootfs, "sys/class/net");
     else
@@ -798,29 +927,44 @@ static void collect_network(struct metrics *m) {
         memset(n, 0, sizeof *n);
         int got = 0;
         for (size_t i = 0; i < NN; i++) {
-            char path[PATH_CAP];
-            if (PATH_FMT(path, "%s/%s/statistics/%s", base, e,
-                         nstats[i].file))
-                continue;
+            char path[512];
+            struct sb b;
+            sb_init(&b, path, sizeof path);
+            sb_str(&b, base);
+            sb_str(&b, "/");
+            sb_str(&b, e);
+            sb_str(&b, "/statistics/");
+            sb_str(&b, nstats[i].file);
+            if (b.trunc) continue;
             char vb[40];
             if (read_abs(path, vb, sizeof vb) > 0) {
-                snprintf(n->val[i], sizeof n->val[i], "%s", vb);
+                n->val[i] = parse_ll(vb);
+                n->got[i] = 1;
                 got = 1;
             }
         }
         if (!got) continue;
-        if (NAME_CPY(n->dev, e)) continue;
+        size_t el = strlen(e);
+        if (el >= sizeof n->dev) continue;
+        memcpy(n->dev, e, el + 1);
         nifs++;
     }
     pdir_close(&d);
     for (size_t i = 0; i < NN; i++) {
         char mname[96];
-        snprintf(mname, sizeof mname, "node_network_%s", nstats[i].suffix);
+        struct sb b;
+        sb_init(&b, mname, sizeof mname);
+        sb_str(&b, "node_network_");
+        sb_str(&b, nstats[i].suffix);
         for (int j = 0; j < nifs; j++) {
-            if (!ifs[j].val[i][0]) continue;
+            if (!ifs[j].got[i]) continue;
             char l[300];
-            snprintf(l, sizeof l, "device=\"%.255s\"", ifs[j].dev);
-            metrics_line(m, mname, l, ifs[j].val[i]);
+            struct sb lb;
+            sb_init(&lb, l, sizeof l);
+            sb_str(&lb, "device=\"");
+            sb_str(&lb, ifs[j].dev);
+            sb_str(&lb, "\"");
+            metrics_line(m, mname, l, mv_uint(ifs[j].val[i]));
         }
     }
 }
@@ -862,11 +1006,14 @@ static void collect_meminfo_extras(struct metrics *m) {
                     *w++ = *c;
                     if (*c == 0) break;
                 }
-                long long kb = strtoll(toks[1], NULL, 10);
-                char metric[128], val[40];
-                snprintf(metric, sizeof metric, "node_memory_%s_bytes", key);
-                snprintf(val, sizeof val, "%lld", kb * 1024);
-                metrics_line(m, metric, "", val);
+                long long kb = parse_ll(toks[1]);
+                char metric[128];
+                struct sb b;
+                sb_init(&b, metric, sizeof metric);
+                sb_str(&b, "node_memory_");
+                sb_str(&b, key);
+                sb_str(&b, "_bytes");
+                metrics_line(m, metric, "", mv_int(kb * 1024));
             }
         }
         if (!nl) break;
@@ -884,8 +1031,11 @@ static void collect_vmstat(struct metrics *m) {
         int n = split_ws(p, toks, 8);
         if (n >= 2) {
             char metric[128];
-            snprintf(metric, sizeof metric, "node_vmstat_%s", toks[0]);
-            metrics_line(m, metric, "", toks[1]);
+            struct sb b;
+            sb_init(&b, metric, sizeof metric);
+            sb_str(&b, "node_vmstat_");
+            sb_str(&b, toks[0]);
+            metrics_line(m, metric, "", mv_str(toks[1]));
         }
         if (!nl) break;
         p = nl + 1;
@@ -893,7 +1043,7 @@ static void collect_vmstat(struct metrics *m) {
 }
 
 static void collect_cpufreq(struct metrics *m) {
-    char base[PATH_CAP];
+    char base[512];
     if (m->rootfs[0])
         make_path(base, sizeof base, m->rootfs, "sys/devices/system/cpu");
     else
@@ -904,44 +1054,64 @@ static void collect_cpufreq(struct metrics *m) {
     while ((e = pdir_next(&d)) != NULL) {
         if (strncmp(e, "cpu", 3) != 0) continue;
         if (strlen(e) <= 3 || !is_all_digits(e + 3)) continue;
-        char cdir[PATH_CAP];
-        if (PATH_FMT(cdir, "%s/%s/cpufreq", base, e)) continue;
+        char cdir[512];
+        struct sb pb;
+        sb_init(&pb, cdir, sizeof cdir);
+        sb_str(&pb, base);
+        sb_str(&pb, "/");
+        sb_str(&pb, e);
+        sb_str(&pb, "/cpufreq");
+        if (pb.trunc) continue;
         int cfd = open(cdir, O_RDONLY);
         if (cfd < 0) continue;
         close(cfd);
         char chip[128];
-        snprintf(chip, sizeof chip, "chip=\"%s\"", e);
+        struct sb cb;
+        sb_init(&cb, chip, sizeof chip);
+        sb_str(&cb, "chip=\"");
+        sb_str(&cb, e);
+        sb_str(&cb, "\"");
         char cur[128] = "", maxf[128] = "", minf[128] = "", gov[128] = "";
-        char path[PATH_CAP];
-        if (!PATH_FMT(path, "%s/%s/cpufreq/scaling_cur_freq", base, e))
-            read_abs(path, cur, sizeof cur);
-        if (!PATH_FMT(path, "%s/%s/cpufreq/cpuinfo_max_freq", base, e))
-            read_abs(path, maxf, sizeof maxf);
-        if (!PATH_FMT(path, "%s/%s/cpufreq/cpuinfo_min_freq", base, e))
-            read_abs(path, minf, sizeof minf);
-        if (!PATH_FMT(path, "%s/%s/cpufreq/scaling_governor", base, e))
-            read_abs(path, gov, sizeof gov);
+        char path[512];
+        const char *files[] = { "/scaling_cur_freq", "/cpuinfo_max_freq",
+                                "/cpuinfo_min_freq", "/scaling_governor" };
+        char *outs[] = { cur, maxf, minf, gov };
+        for (int i = 0; i < 4; i++) {
+            struct sb fb;
+            sb_init(&fb, path, sizeof path);
+            sb_str(&fb, base);
+            sb_str(&fb, "/");
+            sb_str(&fb, e);
+            sb_str(&fb, "/cpufreq");
+            sb_str(&fb, files[i]);
+            if (!fb.trunc) read_abs(path, outs[i], 128);
+        }
 
         char v[40];
         if (cur[0]) {
-            fmt_float(v, strtod(cur, NULL) * 1000.0);
-            metrics_line(m, "node_cpu_scaling_frequency_hertz", chip, v);
-            metrics_line(m, "node_cpufreq_frequency_hertz", chip, v);
+            fmt_f64_shortest(v, (double)parse_ll(cur) * 1000.0);
+            metrics_line(m, "node_cpu_scaling_frequency_hertz", chip, mv_str(v));
+            metrics_line(m, "node_cpufreq_frequency_hertz", chip, mv_str(v));
         }
         if (maxf[0]) {
-            fmt_float(v, strtod(maxf, NULL) * 1000.0);
-            metrics_line(m, "node_cpu_scaling_frequency_max_hertz", chip, v);
-            metrics_line(m, "node_cpufreq_frequency_max_hertz", chip, v);
+            fmt_f64_shortest(v, (double)parse_ll(maxf) * 1000.0);
+            metrics_line(m, "node_cpu_scaling_frequency_max_hertz", chip, mv_str(v));
+            metrics_line(m, "node_cpufreq_frequency_max_hertz", chip, mv_str(v));
         }
         if (minf[0]) {
-            fmt_float(v, strtod(minf, NULL) * 1000.0);
-            metrics_line(m, "node_cpu_scaling_frequency_min_hertz", chip, v);
-            metrics_line(m, "node_cpufreq_frequency_min_hertz", chip, v);
+            fmt_f64_shortest(v, (double)parse_ll(minf) * 1000.0);
+            metrics_line(m, "node_cpu_scaling_frequency_min_hertz", chip, mv_str(v));
+            metrics_line(m, "node_cpufreq_frequency_min_hertz", chip, mv_str(v));
         }
         if (gov[0]) {
             char l[400];
-            snprintf(l, sizeof l, "%s,governor=\"%s\"", chip, gov);
-            metrics_line(m, "node_cpufreq_scaling_governor", l, "1");
+            struct sb b;
+            sb_init(&b, l, sizeof l);
+            sb_str(&b, chip);
+            sb_str(&b, ",governor=\"");
+            sb_str(&b, gov);
+            sb_str(&b, "\"");
+            metrics_line(m, "node_cpufreq_scaling_governor", l, mv_int(1));
         }
     }
     pdir_close(&d);
@@ -966,7 +1136,7 @@ static bool is_part_of(const char *entry, const char *disk) {
 
 static void collect_diskstats(struct metrics *m) {
     /* parent device for partitions (from sys/block/<dev>/<part>/partition) */
-    char sbase[PATH_CAP];
+    char sbase[512];
     if (m->rootfs[0])
         make_path(sbase, sizeof sbase, m->rootfs, "sys/block");
     else
@@ -988,8 +1158,13 @@ static void collect_diskstats(struct metrics *m) {
                    opens and ~800 entries read per cycle on the Pi to size an
                    array of 2. */
                 if (skip_blockdev(ce)) continue;
-                char cd2[PATH_CAP];
-                if (PATH_FMT(cd2, "%s/%s", sbase, ce)) continue;
+                char cd2[512];
+                struct sb b;
+                sb_init(&b, cd2, sizeof cd2);
+                sb_str(&b, sbase);
+                sb_str(&b, "/");
+                sb_str(&b, ce);
+                if (b.trunc) continue;
                 struct pdir sd;
                 if (pdir_open(&sd, cd2) != 0) continue;
                 const char *se;
@@ -1007,22 +1182,37 @@ static void collect_diskstats(struct metrics *m) {
         const char *be;
         while ((be = pdir_next(&bd)) != NULL) {
             if (skip_blockdev(be)) continue;
-            char devdir[PATH_CAP];
-            if (PATH_FMT(devdir, "%s/%s", sbase, be)) continue;
+            char devdir[512];
+            struct sb db;
+            sb_init(&db, devdir, sizeof devdir);
+            sb_str(&db, sbase);
+            sb_str(&db, "/");
+            sb_str(&db, be);
+            if (db.trunc) continue;
             struct pdir pd;
             if (pdir_open(&pd, devdir) != 0) continue;
             const char *pe;
             while ((pe = pdir_next(&pd)) != NULL) {
                 if (!is_part_of(pe, be)) continue;
-                char pf[PATH_CAP];
-                if (PATH_FMT(pf, "%s/%s/partition", devdir, pe)) continue;
+                char pf[512];
+                struct sb fb;
+                sb_init(&fb, pf, sizeof pf);
+                sb_str(&fb, devdir);
+                sb_str(&fb, "/");
+                sb_str(&fb, pe);
+                sb_str(&fb, "/partition");
+                if (fb.trunc) continue;
                 int pfd = open(pf, O_RDONLY);
                 if (pfd >= 0) {
                     close(pfd);
-                    if (par && (size_t)np < pmax &&
-                        !NAME_CPY(par[np].part, pe) &&
-                        !NAME_CPY(par[np].parent, be))
-                        np++;
+                    if (par && (size_t)np < pmax) {
+                        size_t pl = strlen(pe), bl = strlen(be);
+                        if (pl < sizeof par[0].part && bl < sizeof par[0].parent) {
+                            memcpy(par[np].part, pe, pl + 1);
+                            memcpy(par[np].parent, be, bl + 1);
+                            np++;
+                        }
+                    }
                 }
             }
             pdir_close(&pd);
@@ -1047,25 +1237,30 @@ static void collect_diskstats(struct metrics *m) {
                     break;
                 }
             char dl[160];
-            snprintf(dl, sizeof dl, "device=\"%s\",disk=\"%s\"", dev, disk);
-            char v[40];
-            snprintf(v, sizeof v, "%lld", strtoll(toks[3], NULL, 10));
-            metrics_line(m, "node_disk_reads_completed_total", dl, v);
-            snprintf(v, sizeof v, "%lld", strtoll(toks[7], NULL, 10));
-            metrics_line(m, "node_disk_writes_completed_total", dl, v);
-            fmt_float(v, strtod(toks[6], NULL) / 1000.0);
-            metrics_line(m, "node_disk_read_time_seconds_total", dl, v);
-            fmt_float(v, strtod(toks[10], NULL) / 1000.0);
-            metrics_line(m, "node_disk_write_time_seconds_total", dl, v);
-            snprintf(v, sizeof v, "%lld", strtoll(toks[11], NULL, 10));
-            metrics_line(m, "node_disk_io_now", dl, v);
-            fmt_float(v, strtod(toks[12], NULL) / 1000.0);
-            metrics_line(m, "node_disk_io_time_seconds_total", dl, v);
-            fmt_float(v, strtod(toks[13], NULL) / 1000.0);
-            metrics_line(m, "node_disk_io_time_weighted_seconds_total", dl, v);
+            struct sb b;
+            sb_init(&b, dl, sizeof dl);
+            sb_str(&b, "device=\"");
+            sb_str(&b, dev);
+            sb_str(&b, "\",disk=\"");
+            sb_str(&b, disk);
+            sb_str(&b, "\"");
+            metrics_line(m, "node_disk_reads_completed_total", dl,
+                         mv_int(parse_ll(toks[3])));
+            metrics_line(m, "node_disk_writes_completed_total", dl,
+                         mv_int(parse_ll(toks[7])));
+            metrics_line(m, "node_disk_read_time_seconds_total", dl,
+                         mv_dbl((double)parse_ll(toks[6]) / 1000.0));
+            metrics_line(m, "node_disk_write_time_seconds_total", dl,
+                         mv_dbl((double)parse_ll(toks[10]) / 1000.0));
+            metrics_line(m, "node_disk_io_now", dl,
+                         mv_int(parse_ll(toks[11])));
+            metrics_line(m, "node_disk_io_time_seconds_total", dl,
+                         mv_dbl((double)parse_ll(toks[12]) / 1000.0));
+            metrics_line(m, "node_disk_io_time_weighted_seconds_total", dl,
+                         mv_dbl((double)parse_ll(toks[13]) / 1000.0));
             if (n >= 18) {
-                snprintf(v, sizeof v, "%lld", strtoll(toks[14], NULL, 10));
-                metrics_line(m, "node_disk_discards_completed_total", dl, v);
+                metrics_line(m, "node_disk_discards_completed_total", dl,
+                             mv_int(parse_ll(toks[14])));
             }
         }
     nextl:
@@ -1087,7 +1282,7 @@ static void collect_pressure(struct metrics *m) {
                 for (int i = 0; i < n; i++) {
                     if (has_prefix(toks[i], "total=")) {
                         metrics_line(m, "node_pressure_cpu_waiting_seconds_total",
-                                     "", toks[i] + 6);
+                                     "", mv_str(toks[i] + 6));
                         break;
                     }
                 }
@@ -1099,7 +1294,10 @@ static void collect_pressure(struct metrics *m) {
     static const char *ress[] = { "memory", "io" };
     for (size_t r = 0; r < sizeof ress / sizeof *ress; r++) {
         char rel[64], mname[80];
-        snprintf(rel, sizeof rel, "proc/pressure/%s", ress[r]);
+        struct sb rb;
+        sb_init(&rb, rel, sizeof rel);
+        sb_str(&rb, "proc/pressure/");
+        sb_str(&rb, ress[r]);
         body = read_proc(m->rootfs, rel);
         if (!body || !*body) continue;
         char *line = (char *)body;
@@ -1116,10 +1314,14 @@ static void collect_pressure(struct metrics *m) {
                 int n = split_ws(line, toks, 8);
                 for (int i = 0; i < n; i++) {
                     if (has_prefix(toks[i], "total=")) {
-                        snprintf(mname, sizeof mname,
-                                 "node_pressure_%s_%s_seconds_total", ress[r],
-                                 kind);
-                        metrics_line(m, mname, "", toks[i] + 6);
+                        struct sb mb;
+                        sb_init(&mb, mname, sizeof mname);
+                        sb_str(&mb, "node_pressure_");
+                        sb_str(&mb, ress[r]);
+                        sb_str(&mb, "_");
+                        sb_str(&mb, kind);
+                        sb_str(&mb, "_seconds_total");
+                        metrics_line(m, mname, "", mv_str(toks[i] + 6));
                         break;
                     }
                 }
@@ -1157,9 +1359,13 @@ static void collect_netstat(struct metrics *m) {
         int k = nf < nn ? nf : nn;
         for (int j = 0; j < k; j++) {
             char metric[128];
-            snprintf(metric, sizeof metric, "node_netstat_%s_%s", proto,
-                     fields[j]);
-            metrics_line(m, metric, "", nums[j]);
+            struct sb b;
+            sb_init(&b, metric, sizeof metric);
+            sb_str(&b, "node_netstat_");
+            sb_str(&b, proto);
+            sb_str(&b, "_");
+            sb_str(&b, fields[j]);
+            metrics_line(m, metric, "", mv_str(nums[j]));
         }
     }
 }
@@ -1176,7 +1382,7 @@ static void collect_sockstat(struct metrics *m) {
         if (n >= 2) {
             if (strcmp(toks[0], "sockets:") == 0) {
                 if (n >= 3)
-                    metrics_line(m, "node_sockstat_sockets_used", "", toks[2]);
+                    metrics_line(m, "node_sockstat_sockets_used", "", mv_str(toks[2]));
             } else {
                 char proto[64], metric[128];
                 size_t pl = strlen(toks[0]);
@@ -1186,9 +1392,13 @@ static void collect_sockstat(struct metrics *m) {
                 proto[pl] = 0;
                 if (!*proto) goto nexts;
                 for (int i = 1; i + 1 < n; i += 2) {
-                    snprintf(metric, sizeof metric, "node_sockstat_%s_%s",
-                             proto, toks[i]);
-                    metrics_line(m, metric, "", toks[i + 1]);
+                    struct sb b;
+                    sb_init(&b, metric, sizeof metric);
+                    sb_str(&b, "node_sockstat_");
+                    sb_str(&b, proto);
+                    sb_str(&b, "_");
+                    sb_str(&b, toks[i]);
+                    metrics_line(m, metric, "", mv_str(toks[i + 1]));
                 }
             }
         }
@@ -1225,19 +1435,16 @@ static void collect_udp_queues(struct metrics *m) {
             if (m2 <= 5) continue;
             char *c = strchr(toks[4], ':');
             if (!c) continue;
-            tx += (double)strtoull(toks[4], NULL, 16);
-            rx += (double)strtoull(c + 1, NULL, 16);
+            tx += (double)parse_hex(toks[4]);
+            rx += (double)parse_hex(c + 1);
         }
-        char v[40];
-        fmt_float(v, tx);
-        metrics_line(m, "node_udp_queues", "queue=\"tx\"", v);
-        fmt_float(v, rx);
-        metrics_line(m, "node_udp_queues", "queue=\"rx\"", v);
+        metrics_line(m, "node_udp_queues", "queue=\"tx\"", mv_dbl(tx));
+        metrics_line(m, "node_udp_queues", "queue=\"rx\"", mv_dbl(rx));
     }
 }
 
 static void collect_hwmon(struct metrics *m) {
-    char hbase[PATH_CAP];
+    char hbase[512];
     if (m->rootfs[0])
         make_path(hbase, sizeof hbase, m->rootfs, "sys/class/hwmon");
     else
@@ -1248,11 +1455,20 @@ static void collect_hwmon(struct metrics *m) {
         while ((e = pdir_next(&hw)) != NULL) {
             if (strcmp(e, ".") == 0 || strcmp(e, "..") == 0)
                 continue;
-            char cdir[PATH_CAP];
-            if (PATH_FMT(cdir, "%s/%s", hbase, e)) continue;
+            char cdir[512];
+            struct sb hb;
+            sb_init(&hb, cdir, sizeof cdir);
+            sb_str(&hb, hbase);
+            sb_str(&hb, "/");
+            sb_str(&hb, e);
+            if (hb.trunc) continue;
             /* chip name */
-            char fname[PATH_CAP], chip[128];
-            if (PATH_FMT(fname, "%s/name", cdir)) continue;
+            char fname[512], chip[128];
+            struct sb nb;
+            sb_init(&nb, fname, sizeof fname);
+            sb_str(&nb, cdir);
+            sb_str(&nb, "/name");
+            if (nb.trunc) continue;
             if (read_abs(fname, chip, sizeof chip) <= 0) continue;
             /* One slot per sensor, counted from the chip directory: a fixed
                16 dropped sensors on a chip that exposes more. */
@@ -1278,39 +1494,64 @@ static void collect_hwmon(struct metrics *m) {
                 memcpy(num, fn + 4, nn);
                 num[nn] = 0;
                 if (nn == 0 || !is_all_digits(num)) continue;
-                if (PATH_FMT(fname, "%s/temp%s_input", cdir, num)) continue;
+                if (nn >= sizeof temps[0].num) continue;
+                struct sb tb;
+                sb_init(&tb, fname, sizeof fname);
+                sb_str(&tb, cdir);
+                sb_str(&tb, "/temp");
+                sb_str(&tb, num);
+                sb_str(&tb, "_input");
+                if (tb.trunc) continue;
                 if (read_abs(fname, vb, sizeof vb) <= 0) continue;
                 if ((size_t)nt < tmax) {
-                    temps[nt].c = strtod(vb, NULL) / 1000.0;
-                    snprintf(temps[nt].num, sizeof temps[0].num, "%s", num);
+                    temps[nt].c = (double)parse_ll(vb) / 1000.0;
+                    memcpy(temps[nt].num, num, nn + 1);
                     nt++;
                 }
             }
             pdir_close(&cd);
             if (nt > 0) {
-                char l[400], l2[400];
-                snprintf(l, sizeof l, "chip=\"%s\",chip_name=\"%s\"", chip,
-                         chip);
-                metrics_line(m, "node_hwmon_chip_names", l, "1");
+                char l[400];
+                struct sb b;
+                sb_init(&b, l, sizeof l);
+                sb_str(&b, "chip=\"");
+                sb_str(&b, chip);
+                sb_str(&b, "\",chip_name=\"");
+                sb_str(&b, chip);
+                sb_str(&b, "\"");
+                metrics_line(m, "node_hwmon_chip_names", l, mv_int(1));
                 for (int i = 0; i < nt; i++) {
                     char label[256];
-                    if (PATH_FMT(fname, "%s/temp%s_label", cdir,
-                                 temps[i].num))
-                        continue;
-                    if (read_abs(fname, label, sizeof label) <= 0)
-                        snprintf(label, sizeof label, "%s", chip);
-                    char v[40];
-                    fmt_float(v, temps[i].c);
-                    snprintf(l2, sizeof l2, "chip=\"%s\",label=\"%s\"", chip,
-                             label);
-                    metrics_line(m, "node_hwmon_temp_celsius", l2, v);
+                    struct sb lb;
+                    sb_init(&lb, label, sizeof label);
+                    sb_str(&lb, cdir);
+                    sb_str(&lb, "/temp");
+                    sb_str(&lb, temps[i].num);
+                    sb_str(&lb, "_label");
+                    if (lb.trunc) continue;
+                    if (read_abs(label, label, sizeof label) <= 0) {
+                        size_t cl = strlen(chip);
+                        if (cl >= sizeof label) cl = sizeof label - 1;
+                        memcpy(label, chip, cl);
+                        label[cl] = 0;
+                    }
+                    char l2[400];
+                    struct sb b2;
+                    sb_init(&b2, l2, sizeof l2);
+                    sb_str(&b2, "chip=\"");
+                    sb_str(&b2, chip);
+                    sb_str(&b2, "\",label=\"");
+                    sb_str(&b2, label);
+                    sb_str(&b2, "\"");
+                    metrics_line(m, "node_hwmon_temp_celsius", l2,
+                                 mv_dbl(temps[i].c));
                 }
             }
         }
         pdir_close(&hw);
     }
 
-    char tbase[PATH_CAP];
+    char tbase[512];
     if (m->rootfs[0])
         make_path(tbase, sizeof tbase, m->rootfs, "sys/class/thermal");
     else
@@ -1320,14 +1561,24 @@ static void collect_hwmon(struct metrics *m) {
         const char *e;
         while ((e = pdir_next(&td)) != NULL) {
             if (!has_prefix(e, "thermal_zone")) continue;
-            char tf[PATH_CAP];
-            if (PATH_FMT(tf, "%s/%s/temp", tbase, e)) continue;
+            char tf[512];
+            struct sb tb;
+            sb_init(&tb, tf, sizeof tf);
+            sb_str(&tb, tbase);
+            sb_str(&tb, "/");
+            sb_str(&tb, e);
+            sb_str(&tb, "/temp");
+            if (tb.trunc) continue;
             char vb[128];
             if (read_abs(tf, vb, sizeof vb) <= 0) continue;
-            char v[40], l[270];
-            fmt_float(v, strtod(vb, NULL) / 1000.0);
-            snprintf(l, sizeof l, "zone=\"%s\"", e);
-            metrics_line(m, "node_thermal_zone_temp", l, v);
+            char l[270];
+            struct sb b;
+            sb_init(&b, l, sizeof l);
+            sb_str(&b, "zone=\"");
+            sb_str(&b, e);
+            sb_str(&b, "\"");
+            metrics_line(m, "node_thermal_zone_temp", l,
+                         mv_dbl((double)parse_ll(vb) / 1000.0));
         }
         pdir_close(&td);
     }
@@ -1361,18 +1612,24 @@ static void collect_systemd(struct metrics *m) {
         for (int i = 0; i < nst; i++)
             if (strcmp(sts[i].state, st_) == 0) { found = i; break; }
         if (found < 0 && nst < 16) {
-            snprintf(sts[nst].state, sizeof sts[0].state, "%s", st_);
-            sts[nst].n = 0;
-            found = nst++;
+            size_t sl = strlen(st_);
+            if (sl < sizeof sts[0].state) {
+                memcpy(sts[nst].state, st_, sl + 1);
+                sts[nst].n = 0;
+                found = nst++;
+            }
         }
         if (found >= 0) sts[found].n++;
     }
     pclose(p);
     for (int i = 0; i < nst; i++) {
-        char l[300], v[40];
-        snprintf(l, sizeof l, "state=\"%.255s\",type=\"service\"", sts[i].state);
-        snprintf(v, sizeof v, "%ld", sts[i].n);
-        metrics_line(m, "node_systemd_units", l, v);
+        char l[300];
+        struct sb b;
+        sb_init(&b, l, sizeof l);
+        sb_str(&b, "state=\"");
+        sb_str(&b, sts[i].state);
+        sb_str(&b, "\",type=\"service\"");
+        metrics_line(m, "node_systemd_units", l, mv_int(sts[i].n));
     }
 }
 #endif /* ENABLE_SYSTEMD */
@@ -1423,7 +1680,7 @@ static bool textfile_line(struct metrics *m, char *line) {
     while (*p && *p != ' ' && *p != '\t' && *p != '\r') p++;
     *p = 0;
 
-    metrics_line(m, line, labels, value);
+    metrics_line(m, line, labels, mv_str(value));
     return true;
 }
 
@@ -1432,7 +1689,7 @@ static void collect_textfile(struct metrics *m) {
 
     struct pdir d;
     if (pdir_open(&d, g_textfile_dir) != 0) {
-        metrics_line(m, "node_textfile_scrape_error", "", "1");
+        metrics_line(m, "node_textfile_scrape_error", "", mv_int(1));
         return;
     }
 
@@ -1442,17 +1699,26 @@ static void collect_textfile(struct metrics *m) {
         size_t n = strlen(e);
         if (n < 6 || strcmp(e + n - 5, ".prom") != 0) continue;
 
-        char path[PATH_CAP];
-        if (PATH_FMT(path, "%s/%s", g_textfile_dir, e)) { failed++; continue; }
+        char path[512];
+        struct sb b;
+        sb_init(&b, path, sizeof path);
+        sb_str(&b, g_textfile_dir);
+        sb_str(&b, "/");
+        sb_str(&b, e);
+        if (b.trunc) { failed++; continue; }
 
         struct stat st;
         if (stat(path, &st) != 0) { failed++; continue; }
 
-        char label[PATH_CAP], mtime[40];
-        if (snprintf(label, sizeof label, "file=\"%s\"", e) < (int)sizeof label) {
-            fmt_float(mtime, (double)st.st_mtime);
-            metrics_line(m, "node_textfile_mtime_seconds", label, mtime);
-        }
+        char label[512];
+        struct sb lb;
+        sb_init(&lb, label, sizeof label);
+        sb_str(&lb, "file=\"");
+        sb_str(&lb, e);
+        sb_str(&lb, "\"");
+        if (!lb.trunc)
+            metrics_line(m, "node_textfile_mtime_seconds", label,
+                         mv_dbl((double)st.st_mtime));
 
         /* read_proc hands back the one shared buffer, so a file has to be
            parsed to the end before the next one is read. */
@@ -1469,7 +1735,7 @@ static void collect_textfile(struct metrics *m) {
     }
     pdir_close(&d);
 
-    metrics_line(m, "node_textfile_scrape_error", "", failed ? "1" : "0");
+    metrics_line(m, "node_textfile_scrape_error", "", mv_int(failed ? 1 : 0));
 }
 
 void collect_all(struct metrics *m) {
@@ -1560,21 +1826,31 @@ void metrics_dump(struct metrics *m, const char *substr) {
             need += strlen(s[i].labels[j].k) + 1 + strlen(s[i].labels[j].v) + 1;
         size_t cap = need + 192;
         char *buf = malloc(cap);
-        size_t o = 0;
-        buf[o++] = 'D'; buf[o++] = 'U'; buf[o++] = 'M'; buf[o++] = 'P';
-        buf[o++] = ' ';
-        o += (size_t)snprintf(buf + o, cap - o, "%s", s[i].name);
-        buf[o++] = '{';
+        char *o = buf;
+        *o++ = 'D'; *o++ = 'U'; *o++ = 'M'; *o++ = 'P';
+        *o++ = ' ';
+        fmt_str_append(&o, s[i].name);
+        *o++ = '{';
         for (int j = 0; j < s[i].nlabels; j++) {
-            o += (size_t)snprintf(buf + o, cap - o, "%s=%s,",
-                                  s[i].labels[j].k, s[i].labels[j].v);
+            fmt_str_append(&o, s[i].labels[j].k);
+            fmt_str_append(&o, "=");
+            fmt_str_append(&o, s[i].labels[j].v);
+            fmt_str_append(&o, ",");
         }
-        if (s[i].nlabels > 0) buf[o - 1] = '}';
-        else buf[o++] = '}';
+        if (s[i].nlabels > 0) o[-1] = '}';
+        else *o++ = '}';
         char v[40];
-        fmt_float(v, s[i].value);
-        o += (size_t)snprintf(buf + o, cap - o, "=%s\n", v);
-        fwrite(buf, 1, o, stdout);
+        fmt_f64_shortest(v, s[i].value);
+        fmt_str_append(&o, "=");
+        fmt_str_append(&o, v);
+        fmt_str_append(&o, "\n");
+        size_t len = (size_t)(o - buf);
+        size_t off = 0;
+        while (off < len) {
+            ssize_t w = write(1, buf + off, len - off);
+            if (w <= 0) break;
+            off += (size_t)w;
+        }
         free(buf);
     }
 }

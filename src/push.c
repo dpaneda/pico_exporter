@@ -12,7 +12,6 @@
 #include <netinet/in.h>
 #include <stdbool.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -22,6 +21,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "fmt.h"
 #include "push.h"
 
 /* strerror() would drag in picolibc's full 1,152 B errnames table for this one
@@ -65,11 +65,12 @@ bool parse_rw_url(const char *raw, struct rw_url *u) {
 
     u->port = u->use_tls ? 443 : 80;
     if (*p == ':') {
-        long pt = strtol(p + 1, (char **)&q, 10);
-        if (q == p + 1) return false;
+        const char *end;
+        long long pt = fmt_parse_ll(p + 1, &end);
+        if (end == p + 1) return false;
         if (pt < 1 || pt > 65535) return false;
         u->port = (uint16_t)pt;
-        p = q;
+        p = end;
     }
 
     if (*p == 0) {
@@ -184,6 +185,17 @@ struct http_resp {
    is stored, so this only bounds how long a broken server can keep us here. */
 #define HDR_LIMIT 16384
 
+/* Leading-digits reader (the atoi replacement). Skips the blanks the
+   header parse points at ("Content-Length: 354"): atoi did too, and a
+   zero read here would leave the body undrained and desync the stream. */
+static int header_num(const char *s) {
+    while (*s == ' ' || *s == '\t') s++;
+    int v = 0;
+    while (*s >= '0' && *s <= '9')
+        v = v * 10 + (*s++ - '0');
+    return v;
+}
+
 static void read_response(struct rw_conn *c, struct http_resp *r) {
     memset(r, 0, sizeof *r);
     r->content_len = -1;
@@ -215,11 +227,11 @@ static void read_response(struct rw_conn *c, struct http_resp *r) {
             first = 0;
             /* HTTP/1.1 NNN ... */
             if (ll >= 9 && strncmp(line, "HTTP/1.", 7) == 0)
-                r->code = atoi(line + 9);
+                r->code = header_num(line + 9);
             else if (ll >= 6)
-                r->code = atoi(line + 5);
+                r->code = header_num(line + 5);
         } else if (ll >= 15 && strncasecmp(line, "content-length:", 15) == 0) {
-            hl = atoi(line + 15);
+            hl = header_num(line + 15);
         }
         ll = 0;
     }
@@ -245,21 +257,31 @@ void conn_open(struct rw_conn *c, const struct rw_url *u, const char *auth_b64,
     strcpy(c->host, u->host);
     strcpy(c->path, u->path);
     if (auth_b64 && *auth_b64) {
-        snprintf(c->auth, sizeof c->auth, "Basic %s", auth_b64);
+        char *o = c->auth;
+        fmt_str_append(&o, "Basic ");
+        fmt_str_append(&o, auth_b64);
+        *o = 0;
     }
     c->tls = u->use_tls;
 
     int fd = tcp_connect_host(u->host, u->port, timeout_s);
     if (fd < 0) {
         int e = errno;
-        snprintf(c->err, sizeof c->err, "connect: %s (errno=%d)",
-                 errno_name(e), e);
+        char *o = c->err;
+        fmt_str_append(&o, "connect: ");
+        fmt_str_append(&o, errno_name(e));
+        fmt_str_append(&o, " (errno=");
+        fmt_i64_append(&o, e);
+        fmt_str_append(&o, ")");
+        *o = 0;
         return;
     }
     if (c->tls) {
         if (bg_seed() == 0) {
             close(fd);
-            snprintf(c->err, sizeof c->err, "tls: entropy seed failed");
+            char *o = c->err;
+            fmt_str_append(&o, "tls: entropy seed failed");
+            *o = 0;
             return;
         }
         uint32_t days = UNIX_EPOCH_DAYS + (uint32_t)(now_sec / 86400);
@@ -274,19 +296,36 @@ void conn_open(struct rw_conn *c, const struct rw_url *u, const char *auth_b64,
             fd = tcp_connect_host(u->host, u->port, timeout_s);
             if (fd < 0) {
                 int e = errno;
-                snprintf(c->err, sizeof c->err,
-                         "reconnect after tls buffer grow: %s (errno=%d)",
-                         errno_name(e), e);
+                char *o = c->err;
+                fmt_str_append(&o, "reconnect after tls buffer grow: ");
+                fmt_str_append(&o, errno_name(e));
+                fmt_str_append(&o, " (errno=");
+                fmt_i64_append(&o, e);
+                fmt_str_append(&o, ")");
+                *o = 0;
                 return;
             }
-            fprintf(stderr,
-                    "push: peer sent an oversized record; TLS buffer grown to "
-                    "%d bytes\n", bg_iobuf_size());
+            char msg[96];
+            char *o = msg;
+            fmt_str_append(&o,
+                "push: peer sent an oversized record; TLS buffer grown to ");
+            fmt_i64_append(&o, bg_iobuf_size());
+            fmt_str_append(&o, " bytes\n");
+            size_t len = (size_t)(o - msg);
+            size_t off = 0;
+            while (off < len) {
+                ssize_t w = write(2, msg + off, len - off);
+                if (w <= 0) break;
+                off += (size_t)w;
+            }
             hs = bg_handshake(c->host, fd, days, secs);
         }
         if (hs != 0) {
             close(fd);
-            snprintf(c->err, sizeof c->err, "tls err=%d", hs);
+            char *o = c->err;
+            fmt_str_append(&o, "tls err=");
+            fmt_i64_append(&o, hs);
+            *o = 0;
             return;
         }
     }
@@ -297,15 +336,23 @@ void conn_open(struct rw_conn *c, const struct rw_url *u, const char *auth_b64,
 int conn_push(struct rw_conn *c, const void *body, size_t body_len) {
     if (!c->open) return 0;
     char head[512];
-    size_t h = 0;
-    h += (size_t)snprintf(head + h, sizeof head - h,
-        "POST %s HTTP/1.1\r\nHost: %s\r\n", c->path, c->host);
-    if (c->auth[0]) h += (size_t)snprintf(head + h, sizeof head - h,
-        "Authorization: %s\r\n", c->auth);
-    h += (size_t)snprintf(head + h, sizeof head - h,
+    char *o = head;
+    fmt_str_append(&o, "POST ");
+    fmt_str_append(&o, c->path);
+    fmt_str_append(&o, " HTTP/1.1\r\nHost: ");
+    fmt_str_append(&o, c->host);
+    fmt_str_append(&o, "\r\n");
+    if (c->auth[0]) {
+        fmt_str_append(&o, "Authorization: ");
+        fmt_str_append(&o, c->auth);
+        fmt_str_append(&o, "\r\n");
+    }
+    fmt_str_append(&o,
         "Content-Type: application/x-protobuf\r\n"
-        "Content-Length: %zu\r\n"
-        "Connection: keep-alive\r\n\r\n", body_len);
+        "Content-Length: ");
+    fmt_u64_append(&o, body_len);
+    fmt_str_append(&o, "\r\nConnection: keep-alive\r\n\r\n");
+    size_t h = (size_t)(o - head);
     if (conn_write_all(c, head, h) != 0 ||
         (body_len > 0 && conn_write_all(c, body, body_len) != 0)) {
         c->open = false;
