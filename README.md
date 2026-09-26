@@ -1,19 +1,23 @@
 # pico_exporter
 
-### Minimal footprint OTLP system metrics exporter in C
-
+### A tiny Linux system metrics exporter for OTLP
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![Language](https://img.shields.io/badge/language-C11-orange.svg)]() [![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black)](https://github.com/dpaneda/pico_exporter) [![Targets](https://img.shields.io/badge/targets-x86_64%20%7C%20aarch64-brightgreen.svg)]()
 
-pico_exporter is a **system metrics exporter written in C that idles in
-28 kiB of memory on a Raspberry Pi**. It is a drop-in replacement for the Prometheus
-*node_exporter*, but instead of waiting to be scraped it **pushes** the metrics
-to an OTLP gateway over TLS, so there is no need for an extra piece of software
-to pick the metrics up and forward them to the gateway.
+A ~100 KiB static binary that collects system metrics and pushes them directly to an OTLP endpoint, using only ~30 KiB of RAM at idle.
 
-I wanted system metrics from a Raspberry Pi, and every alternative I came
-across seemed to use an absurd amount of resources for the work it had to do.
-So I built my own. What I did not expect was to win three orders of
-magnitude of memory doing it. For the full story, see [JOURNEY.md](JOURNEY.md).
+**Drop-in compatible with Prometheus node_exporter**. It exposes the same system metrics, so existing dashboards can be reused.
+
+Written in C, with x86_64 and aarch64 support, TLS, and no runtime dependencies.
+
+## Why?
+
+I wanted to collect system metrics from a Raspberry Pi and send them to an OTLP endpoint.
+
+The existing solutions worked, but running hundreds of megabytes of telemetry infrastructure just to collect a handful of system metrics felt excessive. So I decided to build a small exporter while keeping compatibility with `node_exporter` metrics.
+
+What I did not expect was to win three orders of magnitude of memory doing it.
+
+[Read the full story →](JOURNEY.md)
 
 ## ✨ Features
 
@@ -23,7 +27,21 @@ magnitude of memory doing it. For the full story, see [JOURNEY.md](JOURNEY.md).
 - **Static binaries, no shared libraries**: both x86_64 and aarch64 targets
   are production-ready.
 
-## ⚖️ Comparison
+
+## 📊 Resource usage
+
+Only Grafana Alloy is compared here, because it is the one that does
+everything and can be measured head-to-head with pico_exporter. Measured on
+my machine, over the same running window:
+
+| | Grafana Alloy | pico_exporter | Ratio |
+|---|---|---|---|
+| Binary size | 530 000 kB | 100 kB | **5300× smaller** |
+| Resting RSS | 400 000 kB | 30 kB | **~13 000× less memory** |
+| CPU per day | 516 s | 6 s | **86× less CPU** |
+| Scrape time | 50 ms | 6 ms | **8× faster** |
+
+## ⚖️ Alternatives
 
 Compared with the usual alternatives, [Grafana Alloy](https://github.com/grafana/alloy) and the Prometheus *node_exporter*:
 
@@ -39,18 +57,6 @@ Compared with the usual alternatives, [Grafana Alloy](https://github.com/grafana
 | Language | Go | Go | C11 |
 | Binary | ~530 MB | ~22 MB | ~100 kB |
 
-### Resources
-
-Only Grafana Alloy is compared here, because it is the one that does
-everything and can be measured head-to-head with pico_exporter. Measured on
-my machine, over the same running window:
-
-| | Grafana Alloy | pico_exporter | Ratio |
-|---|---|---|---|
-| Binary size | 530 000 kB | 100 kB | **5300× smaller** |
-| Resting RSS | 400 000 kB | 30 kB | **~13 000× less memory** |
-| CPU per day | 516 s | 6 s | **86× less CPU** |
-| Scrape time | 50 ms | 6 ms | **8× faster** |
 
 ## 👨‍💻 Getting started
 
