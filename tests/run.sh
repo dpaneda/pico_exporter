@@ -384,6 +384,18 @@ else
   echo "SKIP: OTLP round-trip (build/tests/run_tests missing)"
 fi
 
+# --- stdio-free decimal layer: byte-equality with the %.*g walk + strtod ---
+if [ -x "$HARNESS" ]; then
+  FMOUT="$("$HARNESS" fmt 2>&1)"
+  if echo "$FMOUT" | grep -q 'fmt: OK'; then
+    echo "PASS: fmt layer ($(echo "$FMOUT" | grep -ao '[0-9]* values' | cut -d' ' -f1) values vs picolibc printf/strtod)"
+  else
+    echo "FAIL: fmt layer"; echo "$FMOUT"; fail=1
+  fi
+else
+  echo "SKIP: fmt layer (build/tests/run_tests missing)"
+fi
+
 # --- keep-alive: 3 POSTs over one connection ---
 if command -v python3 >/dev/null 2>&1; then
   rm -f "$DIR/tests/.sink_keepalive.bin"

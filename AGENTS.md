@@ -47,10 +47,14 @@ src/pdir.[ch]         getdents64 directory iterator (no opendir, no heap)
 src/linux_sock.c      picolibc socket/network syscall shims (aarch64 + x86_64)
 srv/                  header stubs picolibc lacks: sys/socket.h, netinet/in.h,
                       sys/utsname.h, sys/sysinfo.h
+src/fmt.[ch]          stdio-free formatters/parsers: integer append, shortest
+                      round-trip %g-layout double renderer, correctly rounded
+                      decimal parser (issue #2 steps 1-2)
 vendor/               compiled-in trust anchors (bearssl_ta_digicert_g2.h)
 tests/run.sh          integration gate driving the harness + fake rootfs
 tests/run_tests.c     single harness binary: TLS, wrong-anchor, oversize-record
-                      recovery, keep-alive, OTLP encode decode round-trip
+                      recovery, keep-alive, OTLP encode decode round-trip,
+                      fmt (decimals vs printf/strtod)
 tests/fake_root.sh    generates a synthetic /proc//sys tree
 tests/sink.py, verify_batch.py   local HTTP sink + OTLP wire decoder
 tools/bearssl_env.sh  pinned URLs+sha256 and the fetch/build functions
@@ -188,15 +192,20 @@ wrapped in `SCRAPE(name)` which reports `node_scrape_collector_*_seconds` /
 the cycle arena (4 kB to start, doubling; a one-off malloc in the one-shot
 modes, which have no arena) — fixed-size slices silently truncate, which is
 how a 300-socket `/proc/net/udp` once reported 63. Directory listings go
-through `pdir` (`getdents64`), never `opendir`/`readdir`: picolibc's
-`fopen`/`opendir` were the only `malloc` callers, so the default build has no
-heap page at all.
+through `pdir` (`getdents64`), never `opendir`/`readdir`: malloc. No stdio
+anywhere (issue #2): values are emitted as tagged `mval`s — the number the
+collector already has (MV_INT/MV_UINT/MV_DBL) or the raw /proc token
+(MV_STR, e.g. loadavg). Push mode stores the double directly; the text
+modes render per kind (`fmt_i64`/`fmt_u64`/`fmt_f64_shortest`). The one
+exception is the systemd flavor: `popen` is stdio by construction, so
+`<stdio.h>` is included under `ENABLE_SYSTEMD` only.
 
 Output modes:
 
 - **text** (`--metrics-once`): `metrics_line()` appends ready-formatted
-  `name{k="v",…} value` lines. Values go through `fmt_float` (shortest
-  round-trip via precisions 1..17 against `strtod`).
+  `name{k="v",…} value` lines. MV_DBL values go through `fmt_f64_shortest`
+  (shortest round-trip, laid out exactly like the old `"%.*g"` walk;
+  `tests/run_tests fmt` pins the contract against picolibc's printf).
 - **samples** (push/`--dump`): fills `msample{name, labels, nlabels, value}`
   (32 B; `labels` points at exactly `nlabels` pairs carved from the same
   per-cycle storage, NULL when there are none); names/labels are arena-backed
@@ -447,12 +456,22 @@ Rules that follow from the measurement:
   `atomic-ungetc=false`, `assert-verbose=false`) buys 704 B of `.text` in
   exchange for changed libc locking and errno semantics — not taken. The one
   flag that did pay was `-fno-unwind-tables`, and it is in.
-- **Avoiding `%g` at the call sites does not drop the float printf code.**
-  picolibc's tinystdio has one `vfprintf` that handles every conversion, so
-  the `dtoa` path is linked as soon as anything calls `printf`. Replacing
-  `fmt_float` with an integer format saved **64 bytes**, measured. Only
-  picolibc's separate integer-only variant removes it, and that is the option
-  ruled out above.
+- ~~**Avoiding `%g` at the call sites does not drop the float printf code.**~~
+  Superseded on the no-stdio branch (issue #2 steps 1-2): with **nothing
+  calling printf/strtod**, picolibc's vfprintf and the dtoa machinery are
+  GC'd from the link — 5.0 kB of `.text` on x86_64, 9.5 kB on aarch64, and
+  10-20% less user CPU per cycle measured with utime over 240 cycles
+  against the fake rootfs (837-879 -> 667-750 µs/cycle). `src/fmt.[ch]`
+  replaces them: `fmt_f64_shortest` renders the shortest round-tripping
+  decimal laid out exactly like the old `"%.*g"` walk, from the exact
+  decimal expansion of the double (finite for binary64) compared against
+  the exact round-to-nearest interval; `fmt_f64_parse` is a correctly
+  rounded strtod replacement over plain decimal constants
+  (127-bit-collapse math, validated against host libc on ~3.5M values and
+  pinned by `run_tests fmt`). picolibc's strtod itself is 1 ulp off on
+  >17-significant-digit inputs (measured; glibc matches my parser), which
+  is why `run_tests fmt` only enforces bit-equality inside 17 digits and
+  1-ulp tolerance beyond.
 - **Anything that must survive the sleep goes to `.bss` or the session
   mapping; anything dead at idle goes to a mapping `idle_sleep` drops.**
   Never put live state in the handshake mapping or below `push_loop`'s
@@ -484,7 +503,10 @@ suite actually covers:
     and `tests/run.sh` turns a newly issued id into a NOTE line;
   - `keepalive` — 3 POSTs on one connection vs `tests/sink.py`;
   - `encode TS NRES FIRST COUNT [k=v…]` — OTLP encode/decode round-trip using
-    an **independent protobuf walker** (no golden fixtures).
+    an **independent protobuf walker** (no golden fixtures);
+  - `fmt` — the decimal layer vs picolibc's printf/strtod (render
+    byte-equality with the `%.*g` walk, parser bit-equality within 17
+    significant digits).
 - **Sink decode** (`verify_batch.py`): totals frames/series; the one-cycle test
   proves `pushed series == dumped samples + up`.
 - TLS cases need network; they `SKIP` cleanly when offline. The python3-based
