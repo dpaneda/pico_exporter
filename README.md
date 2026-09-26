@@ -45,20 +45,18 @@ my machine, over the same running window:
 
 Compared with the usual alternatives, [Grafana Alloy](https://github.com/grafana/alloy) and the Prometheus *node_exporter*:
 
-### Features
-
-| | Grafana Alloy | node_exporter | pico_exporter |
+| | pico_exporter | Grafana Alloy | node_exporter |
 |---|---|---|---|
-| Delivery | push (OTLP) and pull | pull based | push only |
-| Metrics scope | Full OpenTelemetry ecosystem | system metrics (extensible) | core system metrics + textfile |
-| Logs & traces | yes | no | no |
-| Configuration | declarative config file | many flags | a few env vars |
-| Extensibility | large component catalog | collector plugins | fixed set |
-| Language | Go | Go | C11 |
-| Binary | ~530 MB | ~22 MB | ~100 kB |
+| Delivery | push (OTLP) | push (OTLP) and pull | pull |
+| Metrics scope | core system metrics + textfile | Full OpenTelemetry ecosystem | System metrics (extensible) |
+| Logs & traces | no | yes | no |
+| Configuration | a few environment variables | Declarative config file | Many flags |
+| Extensibility | Fixed set | Large component catalog | Collector plugins |
+| Language | C11 | Go | Go |
+| Binary | ~100 KiB | ~530 MB | ~22 MB |
 
 
-## 👨‍💻 Getting started
+## 🚀 Getting started
 
 1.  Download the binary for your architecture from the latest
     [release](https://github.com/dpaneda/pico_exporter/releases):
