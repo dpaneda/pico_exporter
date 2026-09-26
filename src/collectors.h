@@ -84,9 +84,26 @@ void collectors_set_textfile_dir(const char *dir);
 void metrics_init(struct metrics *m, bool text_mode, const char *rootfs);
 void metrics_free(struct metrics *m);
 
+/* Tagged sample value (issue #2 step 1): collectors emit the number they
+ * already have. Push mode stores the double directly -- no text round trip;
+ * the text modes render per kind: STR prints the /proc token verbatim, INT
+ * prints as a decimal integer (the old "%lld"), DBL takes the shortest
+ * round-trip form (the old fmt_float). */
+enum mv_kind { MV_STR, MV_INT, MV_UINT, MV_DBL };
+
+typedef struct mval {
+    enum mv_kind kind;
+    union {
+        const char *s;
+        long long i;
+        unsigned long long u;
+        double d;
+    } v;
+} mval;
+
 /* Emit one series. labels is "" or a pre-formatted `k="v",k2="v2"` string. */
 void metrics_line(struct metrics *m, const char *name, const char *labels,
-                  const char *value);
+                  mval v);
 
 /* Append a raw sample with no labels (samples mode only; e.g. the `up` series). */
 void metrics_add(struct metrics *m, const char *name, double value);

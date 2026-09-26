@@ -22,11 +22,12 @@
  */
 
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "arena.h"
+#include "fmt.h"
 #include "otlp.h"
 
 #define WIRE_VARINT 0
@@ -183,7 +184,20 @@ static int buf_ensure(struct otlp_buf *b, size_t need) {
             na = malloc(need);
             if (!na) return 1;
             heap = 1;
-            fprintf(stderr, "WARN otlp: arena exhausted, malloc %zu\n", need);
+            {
+                char msg[96];
+                char *o = msg;
+                fmt_str_append(&o, "WARN otlp: arena exhausted, malloc ");
+                fmt_u64_append(&o, need);
+                fmt_str_append(&o, "\n");
+                size_t len = (size_t)(o - msg);
+                size_t off = 0;
+                while (off < len) {
+                    ssize_t w = write(2, msg + off, len - off);
+                    if (w <= 0) break;
+                    off += (size_t)w;
+                }
+            }
         }
         /* A heap region from an earlier exhausted cycle is not reclaimed by
            arena_reset, so this is the only chance to release it. */

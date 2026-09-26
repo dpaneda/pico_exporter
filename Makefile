@@ -120,7 +120,7 @@ PICO_LINK  = -s -Wl,--gc-sections \
              -Wl,--build-id=none -Wl,-z,max-page-size=0x1000 -Wl,-T $(PICO_LD) \
              -lgcc -nostdlib -nostartfiles -static -no-pie
 
-SRCS = src/pico_exporter.c src/push.c src/otlp.c src/collectors.c \
+SRCS = src/pico_exporter.c src/push.c src/otlp.c src/collectors.c src/fmt.c \
        src/arena.c src/dns.c src/linux_sock.c src/bearglue.c \
        src/pdir.c src/idle.c
 OBJS = $(SRCS:.c=.o)
@@ -184,13 +184,13 @@ test-bin: $(TESTBIN)/run_tests $(TESTBIN)/pico_exporter-capped \
 $(TESTBIN)/run_tests: INSECURE = 0
 
 $(TESTBIN)/run_tests: tests/run_tests.c src/push.c src/dns.c src/otlp.c \
-	src/arena.c src/linux_sock.c src/bearglue.c \
+	src/arena.c src/linux_sock.c src/bearglue.c src/fmt.c \
 	tests/bearssl_ta_isrg_x1.h $(BEARSSL_LIB) $(PICO_LIBC)
 	@mkdir -p $(TESTBIN)
 	$(CC) $(TEST_CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE -D__picolibc__ \
 		-Itests -I$(PICO_INC) -I$(BEARSSL_INC) \
 		tests/run_tests.c src/push.c src/dns.c src/otlp.c src/arena.c \
-		src/linux_sock.c src/bearglue.c $(BEARSSL_LIB) $(PICO_LINK) -o $@
+		src/linux_sock.c src/bearglue.c src/fmt.c $(BEARSSL_LIB) $(PICO_LINK) -o $@
 
 # Low-cap build for the self-report test: the sample cap is unreachable on a
 # normal host, so the only way to check that a hit cap is reported rather than

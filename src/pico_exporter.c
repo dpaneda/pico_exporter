@@ -4,12 +4,14 @@
  * samples, batches them (BATCH) into OTLP payloads over a keep-alive
  * connection (GW_URL/GW_USER/GW_PASS), and logs the exact
  * `cycle epoch_s=... samples=... blks=... payloadB=... pushed=... http=...`
- * line. */
+ * line.
+ *
+ * No stdio (issue #2): the cycle line is built with the fmt appends and
+ * goes out through write(); stderr messages likewise. */
 
 #define _POSIX_C_SOURCE 200809L
 
 #include <signal.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/utsname.h>
@@ -19,6 +21,7 @@
 #include "arena.h"
 #include "bearglue.h"
 #include "collectors.h"
+#include "fmt.h"
 #include "idle.h"
 #include "otlp.h"
 #include "push.h"
@@ -33,8 +36,20 @@
    MADV_NOHUGEPAGE. */
 #define ARENA_CAP (1u << 20)
 
-static void usage(FILE *f) {
-    fprintf(f,
+/* write-all to a fd (EINTR-safe). */
+static void xwrite(int fd, const char *buf, size_t n) {
+    size_t off = 0;
+    while (off < n) {
+        ssize_t w = write(fd, buf + off, n - off);
+        if (w <= 0) return;
+        off += (size_t)w;
+    }
+}
+
+static void usage(int fd) {
+    char buf[1024];
+    char *o = buf;
+    fmt_str_append(&o,
         "pico_exporter - OTLP/HTTP metrics push (C11)\n"
         "Usage: pico_exporter [--help] [--metrics-once] [--path.rootfs=<dir>]\n"
         "                     [--dump=<substr>]\n\n"
@@ -48,28 +63,36 @@ static void usage(FILE *f) {
         "  BATCH        samples per request (default 100)\n"
         "  TEXTFILE_DIR directory of *.prom files to include (default: off)\n");
 #ifdef ENABLE_SYSTEMD
-    fprintf(f,
+    fmt_str_append(&o,
         "  (built with systemd support: node_systemd_units via systemctl)\n");
 #endif
+    xwrite(fd, buf, (size_t)(o - buf));
 }
 
 /* Parses env var ENV as a long, or FALLBACK when unset/unparseable. */
 static long parse_env_long(const char *env, long fallback) {
     const char *v = getenv(env);
     if (!v || !*v) return fallback;
-    char *end = NULL;
-    long n = strtol(v, &end, 10);
+    const char *end;
+    long n = (long)fmt_parse_ll(v, &end);
     if (end == v || *end) return fallback;
     return n;
 }
 
 /* Reports a hit bound once, on stderr, for the one-shot modes. */
 static void report_capped(const struct metrics *m) {
-    if (m->ndropped || m->nlabels_capped)
-        fprintf(stderr,
-                "WARN sample caps hit: dropped=%zu labels_capped=%zu "
-                "(raise COLLECT_MAX_SAMPLES / COLLECT_MAX_LABELS)\n",
-                m->ndropped, m->nlabels_capped);
+    if (m->ndropped || m->nlabels_capped) {
+        char buf[160];
+        char *o = buf;
+        fmt_str_append(&o,
+            "WARN sample caps hit: dropped=");
+        fmt_u64_append(&o, m->ndropped);
+        fmt_str_append(&o, " labels_capped=");
+        fmt_u64_append(&o, m->nlabels_capped);
+        fmt_str_append(&o,
+            " (raise COLLECT_MAX_SAMPLES / COLLECT_MAX_LABELS)\n");
+        xwrite(2, buf, (size_t)(o - buf));
+    }
 }
 
 static int64_t now_wall_ns(void) {
@@ -94,18 +117,26 @@ static void push_loop(const struct rw_url *u, const char *auth,
     inst[0] = 0;
     const char *inst_env = getenv("INSTANCE");
     if (inst_env && *inst_env) {
-        snprintf(inst, sizeof inst, "%s", inst_env);
+        size_t n = strlen(inst_env);
+        if (n >= sizeof inst) n = sizeof inst - 1;
+        memcpy(inst, inst_env, n);
+        inst[n] = 0;
     } else {
         struct utsname uts;
-        if (uname(&uts) == 0)
-            snprintf(inst, sizeof inst, "%s", uts.nodename);
+        if (uname(&uts) == 0) {
+            size_t n = strlen(uts.nodename);
+            if (n >= sizeof inst) n = sizeof inst - 1;
+            memcpy(inst, uts.nodename, n);
+            inst[n] = 0;
+        }
     }
     long interval_ms = parse_env_long("INTERVAL", 15) * 1000;
     long batch = parse_env_long("BATCH", 100);
     if (batch < 1) batch = 100;
 
     if (u->use_tls && bg_seed() == 0) {
-        fprintf(stderr, "push: entropy seeding failed, OTLP push disabled\n");
+        static const char msg[] = "push: entropy seeding failed, OTLP push disabled\n";
+        xwrite(2, msg, sizeof msg - 1);
         return;
     }
 
@@ -142,8 +173,8 @@ static void push_loop(const struct rw_url *u, const char *auth,
         size_t emitted = m.n;
 
         if (emitted == 0) {
-            fprintf(stderr,
-                    "cycle push: no samples\n");
+            static const char msg[] = "cycle push: no samples\n";
+            xwrite(2, msg, sizeof msg - 1);
             metrics_free(&m);
             otlp_buf_reset(&wbuf);
             idle_sleep(interval_ms);
@@ -200,21 +231,47 @@ static void push_loop(const struct rw_url *u, const char *auth,
            field to every line. */
         char capped[80];
         capped[0] = 0;
-        if (m.ndropped || m.nlabels_capped)
-            snprintf(capped, sizeof capped, " dropped=%zu labels_capped=%zu",
-                     m.ndropped, m.nlabels_capped);
+        if (m.ndropped || m.nlabels_capped) {
+            char *o = capped;
+            fmt_str_append(&o, " dropped=");
+            fmt_u64_append(&o, m.ndropped);
+            fmt_str_append(&o, " labels_capped=");
+            fmt_u64_append(&o, m.nlabels_capped);
+            *o = 0;
+        }
         /* Only when it fires. In the steady state the connection survives the
            sleep, so a reopen means the peer dropped it -- the one thing worth
            knowing about a connection now held across cycles. */
         char reop[32];
         reop[0] = 0;
-        if (reopens) snprintf(reop, sizeof reop, " reopen=%zu", reopens);
-        printf("cycle epoch_s=%lld samples=%zu blks=%zu payloadB=%zu "
-               "pushed=%s http=%d%s%s%s%s\n",
-               (long long)wall_seconds(), emitted, blks, tot_payload,
-               ok ? "true" : "false", last_code,
-               last_err[0] ? " err=" : "", last_err, capped, reop);
-        fflush(stdout);
+        if (reopens) {
+            char *o = reop;
+            fmt_str_append(&o, " reopen=");
+            fmt_u64_append(&o, reopens);
+            *o = 0;
+        }
+        char line[256];
+        char *o = line;
+        fmt_str_append(&o, "cycle epoch_s=");
+        fmt_i64_append(&o, wall_seconds());
+        fmt_str_append(&o, " samples=");
+        fmt_u64_append(&o, emitted);
+        fmt_str_append(&o, " blks=");
+        fmt_u64_append(&o, blks);
+        fmt_str_append(&o, " payloadB=");
+        fmt_u64_append(&o, tot_payload);
+        fmt_str_append(&o, " pushed=");
+        fmt_str_append(&o, ok ? "true" : "false");
+        fmt_str_append(&o, " http=");
+        fmt_i64_append(&o, last_code);
+        if (last_err[0]) {
+            fmt_str_append(&o, " err=");
+            fmt_str_append(&o, last_err);
+        }
+        fmt_str_append(&o, capped);
+        fmt_str_append(&o, reop);
+        fmt_str_append(&o, "\n");
+        xwrite(1, line, (size_t)(o - line));
 
         metrics_free(&m);
         /* After metrics_free, because that is what runs arena_reset: wbuf's
@@ -239,7 +296,7 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0) {
-            usage(stdout);
+            usage(1);
             return 0;
         } else if (strcmp(a, "--metrics-once") == 0) {
             dump_once = true;
@@ -248,7 +305,7 @@ int main(int argc, char **argv) {
         } else if (strncmp(a, "--path.rootfs=", 14) == 0) {
             rootfs = a + 14;
         } else {
-            usage(stderr);
+            usage(2);
             return 1;
         }
     }
@@ -259,7 +316,13 @@ int main(int argc, char **argv) {
         struct metrics m;
         metrics_init(&m, true, rootfs);
         collect_all(&m);
-        fwrite(m.txt, 1, m.tlen, stdout);
+        /* The text buffer is complete; one write loop replaces fwrite. */
+        size_t off = 0;
+        while (off < m.tlen) {
+            ssize_t w = write(1, m.txt + off, m.tlen - off);
+            if (w <= 0) break;
+            off += (size_t)w;
+        }
         /* No report here: text mode has no sample cap and never parses labels,
            so neither counter can move. */
         metrics_free(&m);
@@ -277,13 +340,14 @@ int main(int argc, char **argv) {
 
     const char *url = getenv("GW_URL");
     if (!url || !*url) {
-        usage(stderr);
+        usage(2);
         return 1;
     }
 
     struct rw_url u;
     if (!parse_rw_url(url, &u)) {
-        fprintf(stderr, "pico_exporter: bad GW_URL\n");
+        static const char msg[] = "pico_exporter: bad GW_URL\n";
+        xwrite(2, msg, sizeof msg - 1);
         return 1;
     }
 
@@ -291,7 +355,8 @@ int main(int argc, char **argv) {
     const char *pass = getenv("GW_PASS");
     char auth[256];
     if (!basic_auth(user ? user : "", pass ? pass : "", auth, sizeof auth)) {
-        fprintf(stderr, "pico_exporter: credentials too long\n");
+        static const char msg[] = "pico_exporter: credentials too long\n";
+        xwrite(2, msg, sizeof msg - 1);
         return 1;
     }
 
