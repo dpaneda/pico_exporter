@@ -99,17 +99,6 @@ That had consequences. picolibc does not do name resolution, so resolving the
 gateway's hostname became my problem, and that is why there is a DNS client in
 this repo.
 
-The final step of the libc story came after the no-stdio work (see AGENTS.md's
-issue #2 notes): once nothing called printf or strtod, what was left linking
-from picolibc was _start, a handful of syscall wrappers and str/mem -- small
-enough to stop importing. src/start.c, src/freestand.c and src/alloc.c plus
-src/pico.ld are that replacement, and picolibc with its meson build is gone
-from the repo's dependencies. One by-product it left behind is honored, on
-demand: picolibc's printf/strtod were the oracle that shaped tests/fmt.c's
-round-tripping decimal layer, and tests/picolibc.sh rebuilds just enough
-picolibc (cached under build/deps/picolibc-oracle) to keep running that
-comparison whenever asked -- nothing in the build needs it.
-
 Then TLS, same reason. I had started on WolfSSL, picked because it was a lot
 smaller than OpenSSL, which is where the model reached first and which for
 this use case would have been an atrocity. BearSSL is smaller still, and it
@@ -128,10 +117,10 @@ that optimise for size instead of speed, flags that drop metadata the program
 never uses. None of it changes the code. It just stops shipping the parts that
 were never going to run.
 
-And this went further than my own build. BearSSL gets recompiled
-from source too, with the same flags and with its own features switched off,
-so the library I link against is smaller than the one you would get off the
-shelf.
+And this went further than my own build. picolibc and BearSSL get recompiled
+from source too, with the same flags and with their own features switched off,
+so the libraries I link against are smaller than the ones you would get off
+the shelf.
 
 By the end of this process I brought it down to about 400 kB.
 

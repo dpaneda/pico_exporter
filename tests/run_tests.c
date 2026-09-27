@@ -738,10 +738,8 @@ static int cmd_encode(int argc, char **argv) {
 
 /* --- fmt: the stdio-free decimal layer ------------------------------------- */
 
-/* The sweep lives in fmt_check.inc so the picolibc oracle binary
- * (tests/picolibc.sh -> build/tests/run_tests-picolibc) runs the identical
- * deterministic inputs against picolibc's printf/strtod. This copy's oracle
- * is glibc, the harness's own libc. */
+/* The sweep lives in fmt_check.inc; its oracle is glibc, the harness's own
+ * libc. */
 #include "fmt_check.inc"
 
 static int cmd_fmt(void) { return fmt_check_cmd(); }

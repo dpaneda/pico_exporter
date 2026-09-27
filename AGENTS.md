@@ -12,7 +12,7 @@ Pi. Every 15 s it reads `/proc` + `/sys` + `statvfs`, builds an
 gateway over TLS. Two hard constraints drive every design decision:
 
 1. **Footprint is the goal.** Resting RSS (between cycles, `smaps_rollup`) is
-   28 kB on the Pi (20-32 kB on x86) — see "Memory & footprint". No `malloc` unless the arena is
+   24 kB on the Pi (20-32 kB on x86) — see "Memory & footprint". No `malloc` unless the arena is
    exhausted (never in production), plus the sh runner (`popen_sh`) in the
    SYSTEMD=1 build: per-cycle data goes to the arena, everything else to
    `.bss`, the TLS session mapping, or a mapping `idle_sleep` drops.
@@ -108,6 +108,16 @@ gcc invocation cannot carry per TU. Makefile objects for those same files
 carry `FS_CFLAGS` via a target-specific override; keep the two command lines
 identical by construction, not by hope.
 
+**The one deliberate difference: `build.sh` compiles those three TUs without
+`-flto`** (`CORE_CFLAGS` with `-flto=auto` stripped). They are the libc entry
+points, and as LTO IR the cross gcc's `-flto=auto` partitioning dropped their
+definitions from the final link — `undefined reference to memset` (from
+`collect_cpufreq`) while the host gcc, which keeps them, linked fine. Same
+class of problem as a per-TU flag: it only shows up on the cross link, which
+is why the deployable is the one that has to be built before shipping. The dev
+link still hands LTO IR to the plugin and is unaffected, so this is a
+`build.sh`-only change and `bin/pico_exporter` stays byte-identical.
+
 **`build.sh` declares no flags of its own.** It reads them back out of the
 Makefile through the `print-%` rule (`make print-CORE_CFLAGS`, `print-CPPFLAGS`,
 `print-SRCS`, `print-STATIC_LINK`, `print-FS_FLAGS`, `print-FS_OBJS`),
@@ -166,10 +176,9 @@ steady-state builds stay no-ops.
   `brssl ta` tool.)
 - Nothing else. The libc role is filled by src/start.c + src/freestand.c +
   src/alloc.c + src/pico.ld, compiled with the flags already in the Makefile;
-  there is no picolibc, no meson, no ninja, no libc tarball. (One test-side
-  exception: `tests/picolibc.sh` can provision a picolibc install under
-  `build/deps/picolibc-oracle` for the fmt-vs-picolibc oracle case — on
-  demand, never part of any build.)
+  there is no picolibc, no meson, no ninja, no libc tarball — and no test
+  exception either: the fmt-vs-picolibc oracle went with picolibc (see
+  "Testing").
 
 ## Runtime
 
@@ -426,13 +435,16 @@ rootfs, http; a real host with a bigger arena footprint faults more). Arena
 refaults are the bulk: the kernel's fault-around maps 16 pages per fault, so
 the ~21 text pages and 4 rodata pages come back in about 2-3 faults.
 
-**Pi (aarch64, TLS, live gateway), measured 2026-09-25 after two 60 s
-intervals: `smaps_rollup` Rss 28 kB, Anonymous 20 kB** (`status`: VmRSS 28,
-RssAnon 20, RssFile 8, VmHWM 132 — the HWM is the cycle peak). Per mapping:
-text 4 kB, RW file mapping 8 kB, TLS session mapping 8 kB, stack 8 kB. The
-extra RW page versus x86 is aarch64's first RW page, which holds `.eh_frame`
-plus a 4-byte writable `.except_unordered`, so `PCEIL(_pid_base)` keeps it.
-Before this work the same process read 124 kB (92 file + 32 anon).
+**Pi (aarch64, TLS, live gateway), measured 2026-09-27 after two 60 s
+intervals: `smaps_rollup` Rss 24 kB, Anonymous 20 kB** (`status`: VmRSS 24,
+RssAnon 20, RssFile 4, VmHWM 120 — the HWM is the cycle peak). Per mapping:
+text 4 kB, RW file mapping 4 kB, TLS session mapping 8 kB, stack 8 kB, and no
+`[heap]`. The same process read 28 kB on 2026-09-25 (RssFile 8 kB, RW mapping
+8 kB): the aarch64 first RW page that used to hold `.eh_frame` plus the 4-byte
+writable `.except_unordered` — kept resident by `PCEIL(_pid_base)` — is no
+longer showing up as a second resident page, which is one page of the
+difference; the mechanism was not re-examined, only measured again. Before all
+of this work the same process read 124 kB (92 file + 32 anon).
 Procedure, run after two full intervals (`smaps_rollup` is the figure to
 quote; `status` may lag):
 
@@ -445,7 +457,7 @@ grep -E "VmRSS|RssAnon|RssFile" /proc/$P/status
 | Mapping | RSS at rest | Why it stays |
 |---|---|---|
 | text | 4 kB | the page holding `idle_sleep`; the other ~20 pages refault each cycle |
-| rodata/data | 4 kB (8 on aarch64) | the dirty page: `.rodata` tail, `.data.rel.ro`, `__tls_space`, `.data`, small `.bss`; aarch64 also keeps the `.eh_frame`/`.except_unordered` page |
+| rodata/data | 4 kB | the dirty page: `.rodata` tail, `.data.rel.ro`, `__tls_space`, `.data`, small `.bss`; aarch64 measured 8 kB until 2026-09-25 (an extra `.eh_frame`/`.except_unordered` page) and 4 kB on 2026-09-27 |
 | TLS session mapping | 8 kB | `br_ssl_client_context` + record buffer, alive across the keep-alive sleep |
 | stack | 8-12 kB | env/auxv page(s) plus the `main`/`push_loop` frame; deeper pages are dropped |
 | heap | 0 | no `malloc` unless the arena is exhausted (never in production), plus `popen` in the SYSTEMD=1 build |
@@ -514,13 +526,23 @@ Rules that follow from the measurement:
   against the exact round-to-nearest interval; `fmt_f64_parse` is a
   correctly rounded strtod replacement over plain decimal constants
   (127-bit-collapse math, validated against host glibc on ~3.5M values and
-  pinned by `run_tests fmt`, which now uses glibc as the oracle; the
-  picolibc check that used to live in this case is kept on demand by
-  `tests/picolibc.sh`). glibc's
-  strtod agrees with my parser everywhere measured; picolibc's (the old
-  oracle) was 1 ulp off on >17-significant-digit inputs, which is why
-  `run_tests fmt` still only enforces bit-equality inside 17 digits and
-  1-ulp tolerance beyond.
+  pinned by `run_tests fmt`, whose oracle is the harness's own libc). glibc's
+  strtod agrees with my parser everywhere measured, so `run_tests fmt` still
+  only enforces bit-equality inside 17 digits and 1-ulp tolerance beyond —
+  the tolerance is for the sweep's own >17-digit inputs, not for the oracle.
+- **The freestanding `memset` is word-at-a-time on purpose, and `struct dexp`
+  is not zeroed.** At `-Os` a naive byte loop compiles to `movb/inc/jmp` —
+  ~1 byte/cycle, ~20x picolibc's word loop — and `struct dexp` is `DMAX 1200`
+  (1208 B) on the stack, so zeroing the candidates that `dexp_from_u64()`
+  already fully writes cost 885 `memset` calls and 1.06 MB of stores per
+  cycle. The consumers (`dexp_is_zero`, `dexp_cmp`, `dexp_round`, `mul2`,
+  `div2`, `dexp_to_str`) are all bounded by `ndig`, so the memsets were pure
+  waste. Removing them and making `memset` word-at-a-time took the cycle from
+  11.30M to 6.06M instructions (picolibc's 6.07M) and 11 to 1.2 kB of zeroing,
+  which is what brought `cpufreq` (+38% on the no-stdio branch) and
+  `diskstats` (+24%) back to parity. Both fixes live in `src/fmt.c` and
+  `src/freestand.c`; a head-alignment loop in that `memset` must stay bounded
+  by `n`, or it runs off the end of short unaligned requests.
 - **Anything that must survive the sleep goes to `.bss` or the session
   mapping; anything dead at idle goes to a mapping `idle_sleep` drops.**
   Never put live state in the handshake mapping or below `push_loop`'s
@@ -555,17 +577,15 @@ suite actually covers:
     an **independent protobuf walker** (no golden fixtures);
   - `fmt` — the decimal layer vs glibc's printf/strtod, the harness's own
     libc since the freestanding switch (render byte-equality with the `%.17g`
-    walk, parser bit-equality within 17 significant digits);
-  - `fmt vs picolibc` — `tests/picolibc.sh`: the *same* sweep out of
-    `tests/fmt_check.inc`, compiled against a picolibc install it provisions
-    itself under `build/deps/picolibc-oracle` (host x86_64, sha256-pinned
-    release + meson; first run fetches + builds it, cached thereafter) with
-    picolibc's printf/strtod in the oracle seat. Kept because picolibc's
-    rounding was the original decimal-layer oracle and a mismatch would be a
-    real regression — but never wired into `make` or any build, so clones pay
-    no picolibc dependency for one test; provisioning failures exit 77, which
-    `run.sh` records as SKIP (offline, missing ninja), a failing sweep as
-    FAIL. Reset with `rm -rf build/deps/picolibc-oracle`.
+    walk, parser bit-equality within 17 significant digits). The sweep itself
+    is `tests/fmt_check.inc`. It used to be run a second time against
+    picolibc, provisioned on demand by `tests/picolibc.sh`; that case is
+    gone, and deliberately so: picolibc is in no link anymore, so a libc no
+    binary links cannot arbitrate what the binaries print — and it was the
+    only part of the suite that needed a fetched toolchain, the only one that
+    could FAIL for environmental reasons, and (on the host gcc's default TLS
+    canary, which picolibc's crt0 never sets up) the only one that could
+    report FAIL after having checked every value and passed.
 - **Sink decode** (`verify_batch.py`): totals frames/series; the one-cycle test
   proves `pushed series == dumped samples + up`.
 - TLS cases need network; they `SKIP` cleanly when offline. The python3-based
@@ -596,6 +616,12 @@ in "Memory & footprint" above and update the Pi figure in this file.
 
 ## Conventions & gotchas
 
+- **Do not touch `JOURNEY.md`.** It is the author's own narrative of how the
+  exporter got here, kept in his voice, and it is not a spec to keep in sync
+  with the code — it describes the past, deliberately, not the present tree.
+  Contributors and review fixes leave it alone; the author is the only one who
+  edits it. If something in it is now wrong, say so in the conversation or the
+  PR description and let him decide.
 - **No comments unless they explain a non-obvious decision** — the existing
   code comments are all such justification comments; match that tone.
 - **No `malloc` unless the arena is exhausted (never in production), plus

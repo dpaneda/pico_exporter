@@ -1,9 +1,9 @@
-/* fmt_check.inc - the fmt sweep, included by two libc flavors.
- * Both the glibc harness (tests/run_tests fmt) and the picolibc oracle
- * binary (tests/picolibc.sh -> build/tests/run_tests-picolibc) run this
- * same deterministic sweep; in each binary snprintf("%.*g")+strtod are
- * whatever libc that binary linked, so the sweep pins fmt_f64_shortest/
- * fmt_f64_parse against the oracle libc by construction. */
+/* fmt_check.inc - the fmt sweep, included by the glibc harness
+ * (tests/run_tests fmt). snprintf("%.*g")+strtod are the harness's own libc,
+ * so the sweep pins fmt_f64_shortest/fmt_f64_parse against it by
+ * construction. It used to be included by a second binary linked against
+ * picolibc as well; that oracle went when picolibc left every link, since a
+ * libc no binary links cannot be the arbiter of what one of them prints. */
 #ifndef PICO_FMT_CHECK_INC
 #define PICO_FMT_CHECK_INC
 
@@ -124,9 +124,9 @@ static int fmt_check_cmd(void) {
         size_t used = fmt_f64_parse(str, &got);
         ntest++;
         /* The oracle libc may be 1 ulp off on inputs longer than 17
-         * significant digits (picolibc is, measured against glibc; glibc
-         * matches fmt_f64_parse everywhere measured). Inside 17 digits the
-         * parser must be correctly rounded and agree bit for bit. */
+         * significant digits, so the tolerance covers the sweep's own
+         * >17-digit constants. Inside 17 digits the parser must be
+         * correctly rounded and agree bit for bit. */
         unsigned long long wg, mg;
         memcpy(&wg, &want, 8);
         memcpy(&mg, &got, 8);

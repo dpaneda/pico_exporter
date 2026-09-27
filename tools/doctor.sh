@@ -47,15 +47,6 @@ report "$AARCH64_CC"                   "aarch64 cross gcc (libc-free link)" gcc-
 report "aarch64-linux-gnu-readelf"     "aarch64 layout invariant gate"      binutils-aarch64-linux-gnu
 
 echo
-echo "optional (fmt-vs-picolibc oracle; tests/picolibc.sh SKIPs without it):"
-if command -v ninja >/dev/null 2>&1; then
-  printf '  ok      %-22s %s\n' "ninja" "picolibc build for the fmt oracle"
-else
-  printf '  MISSING %-22s %s\n' "ninja" "fmt-vs-picolibc oracle will SKIP"
-  printf '          install with: sudo apt install %s\n' ninja-build
-fi
-
-echo
 if [ "$fail" -eq 0 ]; then
   echo "all prerequisites present"
 else
