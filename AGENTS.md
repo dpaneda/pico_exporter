@@ -263,7 +263,7 @@ hit the cap. A hit cap is *reported* (`ndropped`/`nlabels_capped` → WARN line
 in one-shot modes, extra fields on the cycle line), never swallowed.
 
 Metric families: build_info, own VmRSS, uname, uptime, load, entropy, memory
-(meminfo extras), stat (cpu/ctx/intr/forks/procs/boot), disk bytes, filefd,
+(meminfo extras), stat (cpu/busy ms/ctx/intr/forks/procs/boot), disk bytes, filefd,
 filesystem, network counters, vmstat, cpufreq, diskstats, pressure, netstat,
 sockstat, udp_queue, hwmon, textfile (if `TEXTFILE_DIR`), systemd (if
 `ENABLE_SYSTEMD`, i.e. `SYSTEMD=1` — not the default).

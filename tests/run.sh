@@ -112,6 +112,7 @@ refute() { # refute <desc> <grep-pattern>
 check "exporter rss positive"     '^node_exporter_resident_memory_bytes [1-9][0-9]*$'
 check "cpu aggregate"             'node_cpu_seconds_total\{mode="user"\} (1e\+01|10\.0)'
 check "cpu idle"                  'node_cpu_seconds_total\{mode="idle"\} (5e\+02|500)'
+check "cpu busy ms"               '^node_cpu_busy_milliseconds_total (3\.1e\+04|31000)$'
 check "cpu scaling cur"           'node_cpu_scaling_frequency_hertz\{chip="cpu0"\} (1\.2e\+09|1200000000)'
 check "cpu scaling max"           'node_cpu_scaling_frequency_max_hertz\{chip="cpu0"\} (1\.2e\+09|1200000000)'
 check "cpu scaling min"           'node_cpu_scaling_frequency_min_hertz\{chip="cpu0"\} (6e\+08|600000000)'

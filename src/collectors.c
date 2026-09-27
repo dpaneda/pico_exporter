@@ -689,6 +689,17 @@ static void collect_stat(struct metrics *m) {
                     metrics_line(m, "node_cpu_seconds_total", modes[i],
                                  mv_dbl(d));
                 }
+                /* Every mode except idle and iowait, so that a rate() over
+                   this counter is busy time in millicores directly (one core
+                   = 1000 ms/s), which is why the unit is milliseconds and not
+                   seconds. iowait counts as not-busy, the usual convention;
+                   guest/guest_nice are already inside user/nice, so the eight
+                   parsed modes are the whole of it. */
+                long long busy = parse_ll(toks[1]) + parse_ll(toks[2])
+                               + parse_ll(toks[3]) + parse_ll(toks[6])
+                               + parse_ll(toks[7]) + parse_ll(toks[8]);
+                metrics_line(m, "node_cpu_busy_milliseconds_total", "",
+                             mv_dbl((double)busy * 1000.0 / clk_tick));
             } else if (strcmp(toks[0], "intr") == 0) {
                 metrics_line(m, "node_intr_total", "", mv_str(toks[1]));
             } else if (strcmp(toks[0], "ctxt") == 0) {
