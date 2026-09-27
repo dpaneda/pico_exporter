@@ -84,12 +84,20 @@ build_bearssl_lib_lto "$BEARSSL_LIB_AARCH64" "$AARCH64_CC" aarch64-linux-gnu-ar
 # One single-invocation link for the main TUs is what makes them see
 # identical flags -- a per-TU mix is what produced libc-mismatch failures in
 # the past (see AGENTS.md).
+#
+# One deliberate difference: the runtime TUs are compiled *without* -flto.
+# They are the libc entry points, and as LTO IR the cross gcc's -flto=auto
+# partitioning drops their definitions from the final link -- the link failed
+# with "undefined reference to memset" (from collect_cpufreq) while the host
+# gcc, which keeps them, linked fine. Compiling them outside the single
+# invocation is exactly what they are for: they must be real objects.
+CORE_FS_CFLAGS="${CORE_CFLAGS//-flto=auto/}"
 mkdir -p bin build/fs
 fs_o=()
 for f in $FS_OBJS; do
   c="${f%.o}.c"
   o="build/fs/$(basename "$f")"
-  "$AARCH64_CC" $CORE_CFLAGS $FS_FLAGS $CPPFLAGS -D_GNU_SOURCE \
+  "$AARCH64_CC" $CORE_FS_CFLAGS $FS_FLAGS $CPPFLAGS -D_GNU_SOURCE \
     -D__PICO_FREESTAND__ -I"$BEARSSL_INC" -c "$c" -o "$o"
   fs_o+=("$o")
 done
