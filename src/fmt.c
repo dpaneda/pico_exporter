@@ -8,9 +8,8 @@
  * fmt_f64_parse() is a correctly-rounded strtod over plain decimal
  * constants. Both were validated against glibc on ~3.5M values (random bit
  * patterns, powers of two +-1 ulp, metrics-like scalings) with zero
- * mismatches; tests/run_tests fmt re-checks the sweep against the harness's
- * own libc on every run, and tests/picolibc.sh re-runs the identical sweep
- * with picolibc's printf/strtod in the oracle seat on demand.
+ * mismatches; tests/run_tests fmt re-checks the deterministic sweep against
+ * the harness's own libc on every run.
  */
 
 #include "fmt.h"
@@ -91,8 +90,13 @@ struct dexp {
     int  dpt;            /* value = 0.<dig> * 10^dpt */
 };
 
+/* No memset: this writes dig[0..k) plus ndig and dpt, and every reader
+   (dexp_cmp, dexp_round, dexp_mul2/div2, dexp_to_str) is bounded by ndig, so
+   nothing past it is ever read. Zeroing 1208 B here used to be invisible under
+   picolibc's word-at-a-time memset and cost a byte loop 20x over once the
+   freestanding one replaced it -- 1 MB of zeroing per cycle, all of it here
+   and in the cand below. */
 static void dexp_from_u64(struct dexp *d, u64 m) {
-    memset(d, 0, sizeof *d);
     char tmp[24];
     int k = 0;
     do {
@@ -245,7 +249,6 @@ void fmt_f64_shortest(char *dst, double v) {
         int dpt = d.dpt;
         int n = dexp_round(&d, p, rd, &dpt);
         struct dexp cand;
-        memset(&cand, 0, sizeof cand);
         for (int i = 0; i < n; i++) cand.dig[i] = rd[i];
         cand.ndig = n;
         cand.dpt = dpt;

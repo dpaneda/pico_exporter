@@ -383,9 +383,20 @@ void *memcpy(void *dst, const void *src, size_t n) {
     return dst;
 }
 
+/* Word-at-a-time, never a byte loop: at -Os gcc leaves a byte memset
+   unrolled-by-nothing (movb/inc/jmp, ~1 byte/cycle), which is ~20x picolibc's
+   word loop and is the single hottest thing in the binary when a caller
+   zeroes kilobytes. The head loop only runs for an unaligned dst. */
 void *memset(void *d, int c, size_t n) {
     unsigned char *d_ = d;
-    for (size_t i = 0; i < n; i++) d_[i] = (unsigned char)c;
+    if (!n) return d;
+    uint64_t pat = (uint64_t)(unsigned char)c * 0x0101010101010101ULL;
+    while (n && ((uintptr_t)d_ & 7)) { *d_++ = (unsigned char)c; n--; }
+    uint64_t *dw = (uint64_t *)d_;
+    size_t nw = n >> 3;
+    for (size_t i = 0; i < nw; i++) dw[i] = pat;
+    d_ = (unsigned char *)(dw + nw);
+    for (size_t i = 0; i < (n & 7); i++) *d_++ = (unsigned char)c;
     return d;
 }
 
