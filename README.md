@@ -22,8 +22,10 @@ What I did not expect was to win three orders of magnitude of memory doing it.
 ## ✨ Features
 
 - **Push-only**: pushes to an HTTPS endpoint, uncompressed.
-- **TLS via BearSSL**: one cipher suite, one curve, trust anchor compiled in.
-- **No `malloc` on the hot cycle path.**
+- **TLS via BearSSL** (the build's single dependency): one cipher suite, one
+  curve, trust anchor compiled in.
+- **No libc, no malloc on the hot path**: freestanding static links with an
+  in-repo syscall layer; the cycle arena serves per-cycle memory.
 - **Static binaries, no shared libraries**: both x86_64 and aarch64 targets
   are production-ready.
 

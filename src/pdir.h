@@ -1,9 +1,10 @@
 #ifndef PDIR_H
 #define PDIR_H
 
-/* Directory iteration without picolibc's opendir(), whose calloc of the DIR
-   is what put the one heap page into the resting footprint. Names only: no
-   collector reads anything else out of a dirent. */
+/* Directory iteration without opendir(), whose calloc of the DIR is what
+   put the one heap page into the resting footprint (and there is no opendir
+   to call at all on the freestanding link). Names only: no collector reads
+   anything else out of a dirent. */
 
 #include <stddef.h>
 

@@ -24,19 +24,14 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
-#include <sys/sysinfo.h>
 #include <sys/utsname.h>
-#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "collectors.h"
 #include "fmt.h"
+#include "freestand.h"
 #include "pdir.h"
-
-#ifdef ENABLE_SYSTEMD
-#include <stdio.h>   /* popen/fgets/pclose: the systemd flavor only */
-#endif
 
 static double clk_tick;
 
@@ -116,7 +111,8 @@ static void make_path(char *path, size_t sz, const char *rootfs, const char *rel
    have no arena and malloc it once. Either way a file that does not fit grows
    the buffer by doubling rather than being truncated, the way a constant
    8 kB once truncated /proc/net/udp on a host with many sockets. Once the
-   heap is in play it stays -- picolibc's malloc keeps whole pages anyway. */
+   heap is in play it stays -- the freestanding malloc keeps whole pages
+   anyway. */
 static struct arena *g_rar;      /* cycle arena, NULL in the one-shot modes */
 static char   *g_rbuf;
 static size_t  g_rcap;
@@ -1586,42 +1582,77 @@ static void collect_hwmon(struct metrics *m) {
 
 #ifdef ENABLE_SYSTEMD
 static void collect_systemd(struct metrics *m) {
-    FILE *p = popen("systemctl list-units --all --type=service -o json-pretty",
-                    "r");
-    if (!p) return;
+    /* popen/fgets/pclose are stdio, and the freestanding build has no stdio;
+       popen_sh runs sh -c over raw clone/execve and pclose_sh reaps. Output
+       is slurped whole into a doubling buffer instead of read a line at a
+       time -- systemctl's json-pretty rows never approach a page, so the
+       FILE*-semantics of mid-line truncation are not load-bearing anywhere
+       the "active" scan cares about. */
+    int fd = popen_sh("systemctl list-units --all --type=service -o json-pretty");
+    if (fd < 0) return;
+    size_t cap = 16384, len = 0;
+    char *buf = (char *)m_alloc(m, cap);
+    if (!buf) { pclose_sh(fd); return; }
+    for (;;) {
+        if (len + 1 >= cap) {
+            /* 4 MB of systemctl output would mean something is deeply wrong
+               with the host; bail out and report nothing instead of growing
+               forever. */
+            if (cap >= 4u << 20) { len = 0; break; }
+            size_t ncap = cap * 2;
+            char *nb = (char *)m_alloc(m, ncap);
+            if (!nb) { break; }
+            memcpy(nb, buf, len);
+            buf = nb;
+            cap = ncap;
+        }
+        ssize_t r = read(fd, buf + len, cap - len - 1);
+        if (r < 0) break;
+        if (r == 0) break;
+        len += (size_t)r;
+    }
+    pclose_sh(fd);
+    buf[len] = 0;
     /* systemd's ActiveState is a closed set of short words (active, reloading,
        inactive, failed, activating, deactivating, maintenance), so 32 B is
        ample; this was state[256], 4 kB of the frame. */
     enum { SYSTEMD_STATE_CAP = 32 };
     struct st { char state[SYSTEMD_STATE_CAP]; long n; } sts[16];
     int nst = 0;
-    char line[512];
-    while (fgets(line, sizeof line, p)) {
-        const char *q = strstr(line, "\"active\"");
-        if (!q) continue;
-        const char *colon = strchr(q + 8, ':');
-        if (!colon) continue;
-        const char *op = strchr(colon + 1, '"');   /* opening quote of value */
-        if (!op) continue;
-        const char *cl = strchr(op + 1, '"');      /* closing quote of value */
-        if (!cl || cl - op - 1 >= (int)sizeof sts[0].state) continue;
-        char st_[SYSTEMD_STATE_CAP];
-        memcpy(st_, op + 1, (size_t)(cl - op - 1));
-        st_[cl - op - 1] = 0;
-        int found = -1;
-        for (int i = 0; i < nst; i++)
-            if (strcmp(sts[i].state, st_) == 0) { found = i; break; }
-        if (found < 0 && nst < 16) {
-            size_t sl = strlen(st_);
-            if (sl < sizeof sts[0].state) {
-                memcpy(sts[nst].state, st_, sl + 1);
-                sts[nst].n = 0;
-                found = nst++;
+    char *p = buf;
+    while (*p) {
+        char *nl = strchr(p, '\n');
+        if (nl) *nl = 0;
+        const char *q = strstr(p, "\"active\"");
+        if (q) {
+            const char *colon = strchr(q + 8, ':');
+            if (colon) {
+                const char *op = strchr(colon + 1, '"');   /* opening quote of value */
+                if (op) {
+                    const char *cl = strchr(op + 1, '"');  /* closing quote of value */
+                    if (cl && cl - op - 1 >= 0 && cl - op - 1 < (int)sizeof sts[0].state) {
+                        char st_[SYSTEMD_STATE_CAP];
+                        memcpy(st_, op + 1, (size_t)(cl - op - 1));
+                        st_[cl - op - 1] = 0;
+                        int found = -1;
+                        for (int i = 0; i < nst; i++)
+                            if (strcmp(sts[i].state, st_) == 0) { found = i; break; }
+                        if (found < 0 && nst < (int)(sizeof sts / sizeof sts[0])) {
+                            size_t sl = strlen(st_);
+                            if (sl < sizeof sts[0].state) {
+                                memcpy(sts[nst].state, st_, sl + 1);
+                                sts[nst].n = 0;
+                                found = nst++;
+                            }
+                        }
+                        if (found >= 0) sts[found].n++;
+                    }
+                }
             }
         }
-        if (found >= 0) sts[found].n++;
+        if (!nl) break;
+        p = nl + 1;
     }
-    pclose(p);
     for (int i = 0; i < nst; i++) {
         char l[300];
         struct sb b;

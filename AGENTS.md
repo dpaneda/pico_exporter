@@ -12,20 +12,26 @@ Pi. Every 15 s it reads `/proc` + `/sys` + `statvfs`, builds an
 gateway over TLS. Two hard constraints drive every design decision:
 
 1. **Footprint is the goal.** Resting RSS (between cycles, `smaps_rollup`) is
-   28 kB on the Pi (20-32 kB on x86) — see "Memory & footprint". No `malloc` unless the arena is
-   exhausted (never in production), plus `popen` in the SYSTEMD=1 build:
-   per-cycle data goes to the arena, everything else to `.bss`, the TLS
-   session mapping, or a mapping `idle_sleep` drops.
+   24 kB on the Pi (20-32 kB on x86) — see "Memory & footprint". No `malloc` unless the arena is
+   exhausted (never in production), plus the sh runner (`popen_sh`) in the
+   SYSTEMD=1 build: per-cycle data goes to the arena, everything else to
+   `.bss`, the TLS session mapping, or a mapping `idle_sleep` drops.
 2. **Everything must self-bootstrap.** A fresh clone needs only host base tools
-   + network once; BearSSL, picolibc and meson are fetched (sha256-pinned) and
-   built into the gitignored `build/deps/`.
+   + network once; BearSSL is fetched (sha256-pinned) and built into the
+   gitignored `build/deps/`. There is no libc to bootstrap: the binaries are
+   **freestanding** since 26-Sep-2026, compiled against the host/cross gcc's
+   headers (declarations only) and linked `-nostdlib -static` with the
+   in-repo runtime — `src/start.c` (crt0), `src/freestand.c` (syscall
+   wrappers + mem/str + the popen sh runner), `src/alloc.c` (a first-fit
+   heap) and `src/pico.ld` (the layout idle.c reads back at runtime).
 
-Two binary flavors, both statically linked against **picolibc** (no glibc):
+Two binary flavors, both static freestanding links (no picolibc since then;
+before that, no glibc):
 
 - `bin/pico_exporter` — **x86_64**, linked by the Makefile with the host `cc`.
   A production binary like the other one; it is also what the test suite runs
   against, being the one that builds on the dev host.
-- `bin/pico_exporter-picolibc-aarch64` — **aarch64 deployable**, linked by
+- `bin/pico_exporter-aarch64` — **aarch64 deployable**, linked by
   `build.sh` with `aarch64-linux-gnu-gcc`.
 
 ## Layout
@@ -44,9 +50,24 @@ src/arena.[ch]        mmap + madvise(MADV_DONTNEED) per-cycle arena
 src/idle.[ch]         drop-then-sleep between cycles: evicts code/rodata/handshake
                       state/deep stack with raw madvise, then raw nanosleep
 src/pdir.[ch]         getdents64 directory iterator (no opendir, no heap)
-src/linux_sock.c      picolibc socket/network syscall shims (aarch64 + x86_64)
-srv/                  header stubs picolibc lacks: sys/socket.h, netinet/in.h,
-                      sys/utsname.h, sys/sysinfo.h
+src/linux_sock.c      raw socket/syscall shims on the freestanding link
+                      (aarch64 + x86_64); empty object under glibc
+src/freestand.[ch]    the libc surface: one raw syscall per entry point
+                      (open/read/write/close, mmap/madvise, clock_gettime/
+                      gettimeofday/time, stat/statvfs), str/mem ops, the
+                      SIGPIPE mask, errno in .bss; popen_sh/pclose_sh replace
+                      stdio's popen with clone+execve of /bin/sh
+src/start.c           _start (in .init.start), p_main: environ walk, auxv
+                      AT_RANDOM canary seed, exit/abort/__stack_chk_fail/_exit,
+                      getenv
+src/alloc.c           the freestanding heap: address-sorted free list over
+                      anonymous mmap spans, coalescing, ~250 B of text
+src/pico.ld           the links' own layout script: .init (KEEP-sorted, so
+                      idle_text_lo stays first) / .text / page-aligned RW
+                      (.rodata/.data.rel.ro/.data/.bss); PROVIDEs etext,
+                      _pid_base, __data_start, __tls_space for idle.c
+srv/                  minimal header stubs that shadow the host headers on
+                      every link: sys/socket.h, netinet/in.h, sys/utsname.h
 src/fmt.[ch]          stdio-free formatters/parsers: integer append, shortest
                       round-trip %g-layout double renderer, correctly rounded
                       decimal parser (issue #2 steps 1-2)
@@ -57,13 +78,13 @@ tests/run_tests.c     single harness binary: TLS, wrong-anchor, oversize-record
                       fmt (decimals vs printf/strtod)
 tests/fake_root.sh    generates a synthetic /proc//sys tree
 tests/sink.py, verify_batch.py   local HTTP sink + OTLP wire decoder
-tools/bearssl_env.sh  pinned URLs+sha256 and the fetch/build functions
-tools/deps.sh         `make deps` driver (bearssl-host, picolibc, bearssl-pico)
+tools/bearssl_env.sh  pinned URL+sha256 and the fetch/build functions
+tools/deps.sh         `make deps` driver (bearssl-host, bearssl-aarch64)
 tools/doctor.sh       `make doctor` host-prerequisite preflight
 tools/fetch_ta.sh     fetch a trust anchor from a live endpoint (`make CAFILE_URL=`)
 tools/gen_ta.sh       render a PEM trust anchor into a vendor/ header
 tools/gen_compile_commands.sh  compile_commands.json for clangd
-build/                objects, test binaries, self-bootstrapped toolchains (gitignored)
+build/                objects, test binaries, self-bootstrapped BearSSL (gitignored)
 bin/                  built binaries (gitignored)
 ```
 
@@ -77,22 +98,40 @@ exist only for the suite: `make test-bin` (`build/tests/run_tests` +
 `make capped` (just the capped one, built with `COLLECT_MAX_SAMPLES=120`).
 
 `make aarch64` runs `build.sh`, which delegates the **x86_64 binary to `make`**
-and then does the aarch64 link itself as a **single gcc `-flto` invocation** —
-compiling every TU in one command is what keeps all TUs on identical flags
-(`-D__picolibc__`, picolibc headers) and avoids the cross-TU libc-mismatch bugs
-of the past.
+and then does the aarch64 link itself: a **single gcc `-flto` invocation** over
+every production TU — one command is what keeps them all on identical flags
+(`-I$(BEARSSL_INC)` declarations) and avoids the cross-TU libc-mismatch bugs
+of the past — **after compiling the three runtime TUs separately**, because
+`src/start.c`/`freestand.c`/`alloc.c` need `$(FS_FLAGS)`
+(`-fno-builtin -fno-stack-protector`, their `FS_CFLAGS` override), which one
+gcc invocation cannot carry per TU. Makefile objects for those same files
+carry `FS_CFLAGS` via a target-specific override; keep the two command lines
+identical by construction, not by hope.
+
+**The one deliberate difference: `build.sh` compiles those three TUs without
+`-flto`** (`CORE_CFLAGS` with `-flto=auto` stripped). They are the libc entry
+points, and as LTO IR the cross gcc's `-flto=auto` partitioning dropped their
+definitions from the final link — `undefined reference to memset` (from
+`collect_cpufreq`) while the host gcc, which keeps them, linked fine. Same
+class of problem as a per-TU flag: it only shows up on the cross link, which
+is why the deployable is the one that has to be built before shipping. The dev
+link still hands LTO IR to the plugin and is unaffected, so this is a
+`build.sh`-only change and `bin/pico_exporter` stays byte-identical.
 
 **`build.sh` declares no flags of its own.** It reads them back out of the
 Makefile through the `print-%` rule (`make print-CORE_CFLAGS`, `print-CPPFLAGS`,
-`print-SRCS`, `print-PICO_LINK PICO_ROOT=<aarch64 root>`, `print-PICO_INC`),
+`print-SRCS`, `print-STATIC_LINK`, `print-FS_FLAGS`, `print-FS_OBJS`),
 forwarding the same `SYSTEMD`/`INSECURE`/`CAFILE`/`GW_URL` on every query so the
 feature defines it compiles with are the ones `make` resolved. The Makefile is
 the only place a compile or link flag is written down; what is genuinely
-aarch64-only lives in `build.sh` (cross compiler, picolibc triplet, the single
-`-flto` invocation). Two values deliberately do not cross the seam:
+aarch64-only lives in `build.sh` (cross compiler, the runtime-object
+pre-compile, the single `-flto` invocation). Two values deliberately do not
+cross the seam:
 
-- `-mstack-protector-guard=global` is x86-only (the aarch64 gcc rejects it),
-  which is why `CORE_CFLAGS` — not `CFLAGS` — is the shared variable.
+- `-mstack-protector-guard=global` is x86-only (the aarch64 gcc rejects it;
+  it also doesn't need it — its default guard is already the global symbol
+  src/start.c seeds), which is why `CORE_CFLAGS` — not `CFLAGS` — is the
+  shared variable.
 - `$(TA_DEF)` carries make-side shell quoting (`'"header.h"'`), so `build.sh`
   rebuilds that one flag from the plain `print-TA_DIR`/`print-TA_HNAME`.
 
@@ -103,7 +142,8 @@ both binaries **byte-identical** (`sha256sum bin/*`), since it changes no flag.
 
 What the knobs do is in [DEVELOPMENT.md](DEVELOPMENT.md); what matters here is
 where they land. `SYSTEMD` → `-DENABLE_SYSTEMD`, compiling in
-`collect_systemd()` (`popen systemctl list-units`); **off by default** — it is
+`collect_systemd()` (fork/exec of `systemctl list-units` via the `popen_sh`
+runner); **off by default** — it is
 the only collector that shells out, and it describes the host's service manager
 rather than the machine, so the default build omits it and
 `build/tests/pico_exporter-systemd` is what keeps it tested. `INSECURE` →
@@ -125,26 +165,29 @@ steady-state builds stay no-ops.
 
 ### Self-bootstrapping deps
 
-`tools/bearssl_env.sh` pins every download by sha256 and builds into
+`tools/bearssl_env.sh` pins the one download by sha256 and builds into
 `build/deps/`:
 
 - **BearSSL** (0.6): source tarball, then three libs — `lib-native`,
-  `lib-x86_64-picolibc` (for the x86_64 binary, built with `cc` **and `-flto`** so
-  the LTO link can reach into it), `lib-aarch64-picolibc` (built with the cross
+  `lib-x86_64` (for the x86_64 binary, built with `cc` **and `-flto`** so
+  the LTO link can reach into it), `lib-aarch64` (built with the cross
   gcc, also `-flto`, plus `-DBR_INT128=0` to drop the `i62` RSA paths).
-- **picolibc 1.8.12**: built from the pinned tarball with meson into
-  `{aarch64,x86_64}-linux/{include,lib}/none`. Meson itself is a pinned tarball
-  run via a PATH shim (never installed system-wide). The host (x86_64) install
-  is configured with a generated `cross-x86_64-linux-gnu.txt` mapping the plain
-  host tools (`cc`/`ar`/…).
+  (`lib-native` is the plain no-LTO lib and only feeds `tools/gen_ta.sh`'s
+  `brssl ta` tool.)
+- Nothing else. The libc role is filled by src/start.c + src/freestand.c +
+  src/alloc.c + src/pico.ld, compiled with the flags already in the Makefile;
+  there is no picolibc, no meson, no ninja, no libc tarball — and no test
+  exception either: the fmt-vs-picolibc oracle went with picolibc (see
+  "Testing").
 
 ## Runtime
 
 ### Cycle (`src/pico_exporter.c`)
 
-- Parse flags, `signal(SIGPIPE, SIG_IGN)` (a write on a server-closed
-  keep-alive socket must trigger a reconnect, not a kill), entropy gate
-  (`bg_seed()`) when the URL is https.
+- Parse flags, block SIGPIPE via `fs_ignore_sigpipe()` (rt_sigprocmask; a
+  write on a server-closed keep-alive socket must surface as EPIPE and
+  trigger a reconnect, not a kill; `signal()` does not exist on a -nostdlib
+  link), entropy gate (`bg_seed()`) when the URL is https.
 - Loop:
   1. `collect_all()` into a `struct metrics` backed by the cycle arena;
      append `up = 1`.
@@ -196,16 +239,18 @@ through `pdir` (`getdents64`), never `opendir`/`readdir`: malloc. No stdio
 anywhere (issue #2): values are emitted as tagged `mval`s — the number the
 collector already has (MV_INT/MV_UINT/MV_DBL) or the raw /proc token
 (MV_STR, e.g. loadavg). Push mode stores the double directly; the text
-modes render per kind (`fmt_i64`/`fmt_u64`/`fmt_f64_shortest`). The one
-exception is the systemd flavor: `popen` is stdio by construction, so
-`<stdio.h>` is included under `ENABLE_SYSTEMD` only.
+models render per kind (`fmt_i64`/`fmt_u64`/`fmt_f64_shortest`). The one
+exception was the systemd flavor: popen is stdio by construction, so it uses
+`popen_sh`/`pclose_sh` (raw clone+execve of `/bin/sh`, see
+`src/freestand.c`) and reads the pipe with `read()` into a doubling buffer
+instead of `fgets`.
 
 Output modes:
 
 - **text** (`--metrics-once`): `metrics_line()` appends ready-formatted
   `name{k="v",…} value` lines. MV_DBL values go through `fmt_f64_shortest`
   (shortest round-trip, laid out exactly like the old `"%.*g"` walk;
-  `tests/run_tests fmt` pins the contract against picolibc's printf).
+  `tests/run_tests fmt` pins the contract against glibc's printf).
 - **samples** (push/`--dump`): fills `msample{name, labels, nlabels, value}`
   (32 B; `labels` points at exactly `nlabels` pairs carved from the same
   per-cycle storage, NULL when there are none); names/labels are arena-backed
@@ -301,11 +346,12 @@ Two rules the size and the flags encode:
   collection), so each batch of a cycle extends it instead of stranding the
   previous batch's region: 28 kB/cycle of abandoned buffers → ~6 kB.
 
-### picolibc socket shims (`src/linux_sock.c` + `srv/`)
+### Freestanding syscall shims (`src/linux_sock.c` + `srv/`)
 
-picolibc's linux port has no `<sys/socket.h>` or socket wrappers, so
-`src/linux_sock.c` provides `socket/connect/sendto/recvfrom/setsockopt/uname`
-via raw `syscall()` with per-arch numbers:
+The freestanding link has no libc socket wrappers and shadowed no glibc
+socket headers, so `src/linux_sock.c` provides
+`socket/connect/sendto/recvfrom/setsockopt/uname` via raw `syscall()` with
+per-arch numbers (empty object on the glibc harness link):
 
 | call | aarch64 | x86_64 |
 |---|---|---|
@@ -316,8 +362,14 @@ via raw `syscall()` with per-arch numbers:
 | setsockopt | 208 | 54 |
 | uname | 160 (newuname) | 63 (struct is 390 bytes) |
 
-plus `sysconf(_SC_CLK_TCK)` and `__errno_location`. Headers it lacks live under
-`srv/` (`netinet/in.h`, `sys/socket.h`, `sys/utsname.h`, `sys/sysinfo.h`).
+plus `sysconf(_SC_CLK_TCK)` (constant 100 — Linux HZ for user space). The
+rest of the syscall surface lives in `src/freestand.c` (one raw wrapper per
+entry point; see its header line for the list). Headers the collectors read
+types from are shadowed by `srv/` (`netinet/in.h`, `sys/socket.h`,
+`sys/utsname.h`) on both links — on glibc they shadow the real ones, which is
+fine because the code only touches the subset they declare; no
+`sys/sysinfo.h` stub exists anymore (the include it hid was vestigial and
+removed).
 
 ## Measuring memory (read this before trusting a number)
 
@@ -383,13 +435,16 @@ rootfs, http; a real host with a bigger arena footprint faults more). Arena
 refaults are the bulk: the kernel's fault-around maps 16 pages per fault, so
 the ~21 text pages and 4 rodata pages come back in about 2-3 faults.
 
-**Pi (aarch64, TLS, live gateway), measured 2026-09-25 after two 60 s
-intervals: `smaps_rollup` Rss 28 kB, Anonymous 20 kB** (`status`: VmRSS 28,
-RssAnon 20, RssFile 8, VmHWM 132 — the HWM is the cycle peak). Per mapping:
-text 4 kB, RW file mapping 8 kB, TLS session mapping 8 kB, stack 8 kB. The
-extra RW page versus x86 is aarch64's first RW page, which holds `.eh_frame`
-plus a 4-byte writable `.except_unordered`, so `PCEIL(_pid_base)` keeps it.
-Before this work the same process read 124 kB (92 file + 32 anon).
+**Pi (aarch64, TLS, live gateway), measured 2026-09-27 after two 60 s
+intervals: `smaps_rollup` Rss 24 kB, Anonymous 20 kB** (`status`: VmRSS 24,
+RssAnon 20, RssFile 4, VmHWM 120 — the HWM is the cycle peak). Per mapping:
+text 4 kB, RW file mapping 4 kB, TLS session mapping 8 kB, stack 8 kB, and no
+`[heap]`. The same process read 28 kB on 2026-09-25 (RssFile 8 kB, RW mapping
+8 kB): the aarch64 first RW page that used to hold `.eh_frame` plus the 4-byte
+writable `.except_unordered` — kept resident by `PCEIL(_pid_base)` — is no
+longer showing up as a second resident page, which is one page of the
+difference; the mechanism was not re-examined, only measured again. Before all
+of this work the same process read 124 kB (92 file + 32 anon).
 Procedure, run after two full intervals (`smaps_rollup` is the figure to
 quote; `status` may lag):
 
@@ -402,7 +457,7 @@ grep -E "VmRSS|RssAnon|RssFile" /proc/$P/status
 | Mapping | RSS at rest | Why it stays |
 |---|---|---|
 | text | 4 kB | the page holding `idle_sleep`; the other ~20 pages refault each cycle |
-| rodata/data | 4 kB (8 on aarch64) | the dirty page: `.rodata` tail, `.data.rel.ro`, `__tls_space`, `.data`, small `.bss`; aarch64 also keeps the `.eh_frame`/`.except_unordered` page |
+| rodata/data | 4 kB | the dirty page: `.rodata` tail, `.data.rel.ro`, `__tls_space`, `.data`, small `.bss`; aarch64 measured 8 kB until 2026-09-25 (an extra `.eh_frame`/`.except_unordered` page) and 4 kB on 2026-09-27 |
 | TLS session mapping | 8 kB | `br_ssl_client_context` + record buffer, alive across the keep-alive sleep |
 | stack | 8-12 kB | env/auxv page(s) plus the `main`/`push_loop` frame; deeper pages are dropped |
 | heap | 0 | no `malloc` unless the arena is exhausted (never in production), plus `popen` in the SYSTEMD=1 build |
@@ -417,7 +472,10 @@ size):
 |---|---|---|
 | BearSSL | 30.4 kB | 7.7 kB (6.1 kB of it T0 bytecode) |
 | pico_exporter | 26.2 kB | — |
-| picolibc | 19.1 kB | 6.3 kB |
+
+(picolibc's former 19.1 kB / 6.3 kB rows are gone from the link entirely
+since the freestanding switch; the runtime replacing it is ~1.3 kB of text,
+counted inside pico_exporter now.)
 
 Rules that follow from the measurement:
 
@@ -451,27 +509,40 @@ Rules that follow from the measurement:
   `-fno-stack-protector` and `-Wl,-z,norelro` each change the output by
   **zero bytes**. `-flto-partition=one` saves 256 B of `.text` and
   `-Wl,--build-id=none` 128 B of file, neither crossing a page.
-  `-Wl,--icf=all` is gold/lld only and does not link. Trimming picolibc's
-  meson options (`fast-strcmp=false`, `single-thread=true`,
-  `atomic-ungetc=false`, `assert-verbose=false`) buys 704 B of `.text` in
-  exchange for changed libc locking and errno semantics — not taken. The one
-  flag that did pay was `-fno-unwind-tables`, and it is in.
+  `-Wl,--icf=all` is gold/lld only and does not link. picolibc's meson
+  option-trimming experiments are moot — that libc is gone from the link
+  (26-Sep-2026). The one flag that did pay was `-fno-unwind-tables`, and it
+  is in.
 - ~~**Avoiding `%g` at the call sites does not drop the float printf code.**~~
   Superseded on the no-stdio branch (issue #2 steps 1-2): with **nothing
-  calling printf/strtod**, picolibc's vfprintf and the dtoa machinery are
-  GC'd from the link — 5.0 kB of `.text` on x86_64, 9.5 kB on aarch64, and
-  10-20% less user CPU per cycle measured with utime over 240 cycles
-  against the fake rootfs (837-879 -> 667-750 µs/cycle). `src/fmt.[ch]`
-  replaces them: `fmt_f64_shortest` renders the shortest round-tripping
-  decimal laid out exactly like the old `"%.*g"` walk, from the exact
-  decimal expansion of the double (finite for binary64) compared against
-  the exact round-to-nearest interval; `fmt_f64_parse` is a correctly
-  rounded strtod replacement over plain decimal constants
-  (127-bit-collapse math, validated against host libc on ~3.5M values and
-  pinned by `run_tests fmt`). picolibc's strtod itself is 1 ulp off on
-  >17-significant-digit inputs (measured; glibc matches my parser), which
-  is why `run_tests fmt` only enforces bit-equality inside 17 digits and
-  1-ulp tolerance beyond.
+  calling printf/strtod** on the push path, the whole libc was then removed
+  outright (freestanding link, 26-Sep-2026) rather than trimmed further —
+  5.0 kB of `.text` on x86_64, 9.5 kB on aarch64 had already gone with the
+  printf/strtod callers, plus 10-20% less user CPU per cycle measured over
+  240 cycles against the fake rootfs (837-879 -> 667-750 µs/cycle).
+  `src/fmt.[ch]` does the job: `fmt_f64_shortest` renders the shortest
+  round-tripping decimal laid out exactly like the old `"%.*g"` walk, from
+  the exact decimal expansion of the double (finite for binary64) compared
+  against the exact round-to-nearest interval; `fmt_f64_parse` is a
+  correctly rounded strtod replacement over plain decimal constants
+  (127-bit-collapse math, validated against host glibc on ~3.5M values and
+  pinned by `run_tests fmt`, whose oracle is the harness's own libc). glibc's
+  strtod agrees with my parser everywhere measured, so `run_tests fmt` still
+  only enforces bit-equality inside 17 digits and 1-ulp tolerance beyond —
+  the tolerance is for the sweep's own >17-digit inputs, not for the oracle.
+- **The freestanding `memset` is word-at-a-time on purpose, and `struct dexp`
+  is not zeroed.** At `-Os` a naive byte loop compiles to `movb/inc/jmp` —
+  ~1 byte/cycle, ~20x picolibc's word loop — and `struct dexp` is `DMAX 1200`
+  (1208 B) on the stack, so zeroing the candidates that `dexp_from_u64()`
+  already fully writes cost 885 `memset` calls and 1.06 MB of stores per
+  cycle. The consumers (`dexp_is_zero`, `dexp_cmp`, `dexp_round`, `mul2`,
+  `div2`, `dexp_to_str`) are all bounded by `ndig`, so the memsets were pure
+  waste. Removing them and making `memset` word-at-a-time took the cycle from
+  11.30M to 6.06M instructions (picolibc's 6.07M) and 11 to 1.2 kB of zeroing,
+  which is what brought `cpufreq` (+38% on the no-stdio branch) and
+  `diskstats` (+24%) back to parity. Both fixes live in `src/fmt.c` and
+  `src/freestand.c`; a head-alignment loop in that `memset` must stay bounded
+  by `n`, or it runs off the end of short unaligned requests.
 - **Anything that must survive the sleep goes to `.bss` or the session
   mapping; anything dead at idle goes to a mapping `idle_sleep` drops.**
   Never put live state in the handshake mapping or below `push_loop`'s
@@ -504,9 +575,17 @@ suite actually covers:
   - `keepalive` — 3 POSTs on one connection vs `tests/sink.py`;
   - `encode TS NRES FIRST COUNT [k=v…]` — OTLP encode/decode round-trip using
     an **independent protobuf walker** (no golden fixtures);
-  - `fmt` — the decimal layer vs picolibc's printf/strtod (render
-    byte-equality with the `%.*g` walk, parser bit-equality within 17
-    significant digits).
+  - `fmt` — the decimal layer vs glibc's printf/strtod, the harness's own
+    libc since the freestanding switch (render byte-equality with the `%.17g`
+    walk, parser bit-equality within 17 significant digits). The sweep itself
+    is `tests/fmt_check.inc`. It used to be run a second time against
+    picolibc, provisioned on demand by `tests/picolibc.sh`; that case is
+    gone, and deliberately so: picolibc is in no link anymore, so a libc no
+    binary links cannot arbitrate what the binaries print — and it was the
+    only part of the suite that needed a fetched toolchain, the only one that
+    could FAIL for environmental reasons, and (on the host gcc's default TLS
+    canary, which picolibc's crt0 never sets up) the only one that could
+    report FAIL after having checked every value and passed.
 - **Sink decode** (`verify_batch.py`): totals frames/series; the one-cycle test
   proves `pushed series == dumped samples + up`.
 - TLS cases need network; they `SKIP` cleanly when offline. The python3-based
@@ -519,9 +598,10 @@ suite actually covers:
 - **Layout invariant** (`tests/run.sh`, before the fake-root run, on
   `bin/pico_exporter` and, if built, the aarch64 binary): `readelf` must show
   no relocations and no writable section other than `.data.rel.ro` inside
-  the RW range `idle_sleep` drops, `[PCEIL(.rodata), PFLOOR(min(.tls_space,
-  .data)))`, so a picolibc or linker-script change cannot silently put
-  written data under `MADV_DONTNEED`.
+  the RW range `idle_sleep` drops, `[PCEIL(.rodata), PFLOOR(min(__tls_space,
+  __data_start)))` — pico.ld makes both markers ADDR(.data), since the
+  freestanding binary has no TLS sections — so a linker-script change cannot
+  silently put written data under `MADV_DONTNEED`.
 
 ## Deployment
 
@@ -536,22 +616,36 @@ in "Memory & footprint" above and update the Pi figure in this file.
 
 ## Conventions & gotchas
 
+- **Do not touch `JOURNEY.md`.** It is the author's own narrative of how the
+  exporter got here, kept in his voice, and it is not a spec to keep in sync
+  with the code — it describes the past, deliberately, not the present tree.
+  Contributors and review fixes leave it alone; the author is the only one who
+  edits it. If something in it is now wrong, say so in the conversation or the
+  PR description and let him decide.
 - **No comments unless they explain a non-obvious decision** — the existing
   code comments are all such justification comments; match that tone.
 - **No `malloc` unless the arena is exhausted (never in production), plus
-  `popen` in the SYSTEMD=1 build** (`tests/run.sh` fails on a `[heap]`
-  mapping). Per-cycle data goes to the arena; state that must
-  survive the sleep goes to `.bss` or the TLS session mapping; state dead at
-  idle goes to a mapping `idle_sleep` drops. Read `/proc`//`/sys` with
-  `open`/`read` and directories with `pdir`, never stdio/dirent.
+  the sh runner in the SYSTEMD=1 build** (`tests/run.sh` fails on a `[heap]`
+  mapping; the freestanding `malloc` in src/alloc.c never maps `[heap]` —
+  its chunks are anonymous mmaps). Per-cycle data goes to the arena; state
+  that must survive the sleep goes to `.bss` or the TLS session mapping;
+  state dead at idle goes to a mapping `idle_sleep` drops. Read `/proc` and
+  `/sys` with `open`/`read` and directories with `pdir`, never stdio/dirent.
 - **C11, `-std=c11`.** Compile every TU with identical flags: `-D_GNU_SOURCE`,
-  `-D__picolibc__`, `-Isrv`, picolibc + BearSSL include dirs. Mixing them once
-  produced `__isoc23_strtoll`/errno/uname mismatches between TUs.
+  `-D__PICO_FREESTAND__`, `-Isrv`, BearSSL's include dir (the host/cross
+  headers ride along as declarations only). Mixing flag sets once produced
+  `__isoc23_strtoll`/errno/uname mismatches between TUs; the remaining
+  per-TU exception is `FS_FLAGS` on the three runtime TUs, see "Build
+  system".
 - **Stack canary**: the x86_64 build needs `-mstack-protector-guard=global`.
-  The host gcc defaults to the glibc TLS canary (`%fs:0x28`) but picolibc seeds
-  a *global* `__stack_chk_guard`; the mismatch reads a phantom smash (triggered
-  by any `/proc` file ≥ 4095 B) and `read_proc` aborts. The aarch64 gcc rejects
-  the option and needs nothing.
+  The host gcc defaults to the glibc TLS canary (`%fs:0x28`), but there is no
+  TLS on a -nostdlib link — src/start.c seeds a *global* `__stack_chk_guard`
+  from auxv's AT_RANDOM; the mismatch reads a phantom smash (triggered by any
+  `/proc` file ≥ 4095 B) and `read_proc` aborts. The aarch64 gcc rejects the
+  option and defaults to the global guard itself. On the glibc harness build
+  the flag must instead be absent (TEST_CFLAGS filters it): a glibc link has
+  no global guard, and `-mstack-protector-guard=global` there is another
+  phantom-smash generator.
 - **Network byte order matters in `s_addr`** — copy the 4 RDATA bytes, do not
   shift-shift-OR.
 - **`idle_sleep` must stay a self-contained page.** No calls out (not even

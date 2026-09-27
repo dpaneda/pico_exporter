@@ -1,4 +1,5 @@
-/* Minimal Linux utsname for picolibc (aarch64 struct layout). */
+/* Minimal Linux utsname layout (65-byte fields are the Linux standard on
+   every arch), shadowing the host header on every link. */
 #ifndef _SYS_UTSNAME_H_
 #define _SYS_UTSNAME_H_
 

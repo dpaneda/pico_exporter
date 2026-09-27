@@ -1,4 +1,5 @@
-/* Minimal IPv4 structs for picolibc linux. */
+/* Minimal IPv4 structs, shadowing the host header on every link (the
+   endianness permutation of htons/htonl is endianness-portable C). */
 #ifndef _NETINET_IN_H_
 #define _NETINET_IN_H_
 

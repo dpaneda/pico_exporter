@@ -11,7 +11,7 @@
 
 #include "arena.h"
 
-/* Linux-only; picolibc's headers do not carry it. */
+/* Linux-only; MADV_NOHUGEPAGE lacks a POSIX declaration, so guard it. */
 #ifndef MADV_NOHUGEPAGE
 #define MADV_NOHUGEPAGE 15
 #endif

@@ -1,6 +1,6 @@
 /* dns.h - minimal RFC 1035 A-record resolver replacing getaddrinfo().
- * Shared by the musl/glibc dev build (libc sockets) and the picolibc
- * deployable (sockets are shimmed via srv/ headers + src/linux_sock.c). */
+ * Shared by every link: libc sockets under the glibc harness, raw syscalls
+ * via srv/ headers + src/linux_sock.c on the freestanding links. */
 #ifndef DNS_H
 #define DNS_H
 
