@@ -541,26 +541,26 @@ if command -v python3 >/dev/null 2>&1; then
     fail=1
   fi
 
-  # --- batched push (BATCH=100): several frames, all decode ---
+  # --- one request per cycle, and it is the whole sample set ---
   BPORT=$((30000 + RANDOM % 10000))
   rm -f "$DIR/tests/.sink_batch.bin" "$DIR/tests/.sink_batch.bin.conns"
   python3 "$DIR/tests/sink.py" "$DIR/tests/.sink_batch.bin" "$BPORT" &
   BP_SINKD=$!
   sleep 0.5
   GW_URL="http://127.0.0.1:$BPORT/rw" GW_USER="" GW_PASS="" \
-  INSTANCE="testhost" INTERVAL=2 BATCH=100 \
+  INSTANCE="testhost" INTERVAL=2 \
   timeout 7 "$BIN" --path.rootfs="$ROOT" \
     >"$DIR/tests/.push_batch.log" 2>&1
   kill "$BP_SINKD" 2>/dev/null
   wait "$BP_SINKD" 2>/dev/null
-  BLKS="$(grep -ao 'blks=[0-9]*' "$DIR/tests/.push_batch.log" | head -1)"
+  CYCLES="$(grep -c 'pushed=true' "$DIR/tests/.push_batch.log" || true)"
   VB="$(python3 "$DIR/tests/verify_batch.py" "$DIR/tests/.sink_batch.bin" 2>/dev/null || true)"
-  if [ -n "$VB" ] \
-     && [ "$(echo "$VB" | grep -ao 'frames=[0-9]*' | cut -d= -f2)" -ge 4 ] \
-     && [ "$(echo "$VB" | grep -ao 'series=[0-9]*' | cut -d= -f2)" -ge 250 ]; then
-    echo "PASS: batched push (${BLKS:-blks=0} per cycle, sink decoded: $VB)"
+  FRAMES="$(echo "$VB" | grep -ao 'frames=[0-9]*' | cut -d= -f2)"
+  SERIES="$(echo "$VB" | grep -ao 'series=[0-9]*' | cut -d= -f2)"
+  if [ -n "$VB" ] && [ "$SERIES" -ge 250 ] && [ "$FRAMES" -eq "$CYCLES" ]; then
+    echo "PASS: one request per cycle (${CYCLES} cycles, ${FRAMES} frames, $VB)"
   else
-    echo "FAIL: batched push (log: $BLKS, sink: ${VB:-none})"
+    echo "FAIL: expected one frame per cycle (cycles=$CYCLES frames=${FRAMES:-0} sink: ${VB:-none})"
     cat "$DIR/tests/.push_batch.log"
     fail=1
   fi
@@ -579,8 +579,8 @@ if command -v python3 >/dev/null 2>&1; then
   # --- INTERVAL is a period, not a delay. The sleep used to be a flat INTERVAL
   # *after* the work, so the push rate was INTERVAL + the peer's latency:
   # measured 18.19 s for an INTERVAL of 15, moving with the gateway's latency.
-  # BATCH=1024 keeps it one request so the work is the delay and not 5x it,
-  # and a fast sink would hide the bug completely -- the delay is the point.
+  # One request per cycle, so the work *is* the delay, and a fast sink would
+  # hide the bug completely -- the delay is the point.
   DPORT=$((40000 + RANDOM % 10000))
   rm -f "$DIR/tests/.sink_delay.bin" "$DIR/tests/.sink_delay.bin.conns"
   SINK_DELAY_MS=800 python3 "$DIR/tests/sink.py" "$DIR/tests/.sink_delay.bin" \
@@ -588,7 +588,7 @@ if command -v python3 >/dev/null 2>&1; then
   D_SINKD=$!
   sleep 0.5
   GW_URL="http://127.0.0.1:$DPORT/rw" GW_USER="" GW_PASS="" \
-  INSTANCE="testhost" INTERVAL=2 BATCH=1024 \
+  INSTANCE="testhost" INTERVAL=2 \
     timeout 13 "$BIN" --path.rootfs="$ROOT" \
     >"$DIR/tests/.push_delay.log" 2>&1
   kill "$D_SINKD" 2>/dev/null

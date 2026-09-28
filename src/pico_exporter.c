@@ -1,9 +1,9 @@
 /* pico_exporter.c - entry point, config, push cycle loop.
  *
  * --metrics-once / --dump one-shot paths, then a 15 s cycle that collects
- * samples, batches them (BATCH) into OTLP payloads over a keep-alive
+ * samples and pushes them as a single OTLP request over a keep-alive
  * connection (GW_URL/GW_USER/GW_PASS), and logs the exact
- * `cycle epoch_s=... samples=... blks=... payloadB=... pushed=... http=...`
+ * `cycle epoch_s=... samples=... payloadB=... pushed=... http=...`
  * line.
  *
  * No stdio (issue #2): the cycle line is built with the fmt appends and
@@ -60,7 +60,6 @@ static void usage(int fd) {
         "  JOB          OTel service.name (-> Prometheus job)\n"
         "  INSTANCE     OTel service.instance.id (default: uname -n)\n"
         "  INTERVAL     push interval seconds (default 15)\n"
-        "  BATCH        samples per request (default 100)\n"
         "  TEXTFILE_DIR directory of *.prom files to include (default: off)\n");
 #ifdef ENABLE_SYSTEMD
     fmt_str_append(&o,
@@ -128,7 +127,7 @@ static long period_left(int64_t deadline) {
 
 static int64_t wall_seconds(void) { return (int64_t)time(NULL); }
 
-/* pushMain() port: collects on an INTERVAL cycle and pushes OTLP batches. */
+/* pushMain() port: collects on an INTERVAL cycle and pushes the OTLP request. */
 static void push_loop(const struct rw_url *u, const char *auth,
                       const char *rootfs) {
     idle_stack_floor();
@@ -156,8 +155,6 @@ static void push_loop(const struct rw_url *u, const char *auth,
         }
     }
     long interval_ms = parse_env_long("INTERVAL", 15) * 1000;
-    long batch = parse_env_long("BATCH", 100);
-    if (batch < 1) batch = 100;
 
     if (u->use_tls && bg_seed() == 0) {
         static const char msg[] = "push: entropy seeding failed, OTLP push disabled\n";
@@ -176,11 +173,11 @@ static void push_loop(const struct rw_url *u, const char *auth,
     collectors_set_arena(&ar);
     struct otlp_buf wbuf = { .ar = &ar };
 
-    /* Held across cycles, not merely across the batches of one cycle. The
+    /* Held across cycles, not merely across the one request of a cycle. The
        handshake was 24.5 ms of the Pi's 45 ms cycle -- more CPU than the
        entire collection -- and it bought nothing: the gateway keeps an idle
        connection well past the interval (measured >200 s). A peer that does
-       not is covered by the retry in the batch loop. */
+       not is covered by the two attempts below. */
     struct rw_conn conn;
     memset(&conn, 0, sizeof conn);
     conn.fd = -1;
@@ -208,48 +205,42 @@ static void push_loop(const struct rw_url *u, const char *auth,
         }
 
         /* The OTLP view is the msamples directly: otlp_encode reads
-           msample{.name,.labels,.nlabels,.value}, no per-cycle copy. */
+           msample{.name,.labels,.nlabels,.value}, no per-cycle copy. The whole
+           sample set goes out as one request: COLLECT_MAX_SAMPLES is what
+           bounds its size, so a second layer of chunking would be a knob whose
+           only effect was to decide how many round trips a cycle cost. */
 
-        size_t blks = 0, tot_payload = 0, reopens = 0;
+        otlp_encode(&wbuf, m.samples, emitted, res, 2, ts_ns, 0, emitted);
+        size_t tot_payload = wbuf.len;
+        size_t reopens = 0;
         int last_code = 0;
         const char *last_err = "";
 
-        while (blks * (size_t)batch < emitted) {
-            size_t first = blks * (size_t)batch;
-            otlp_encode(&wbuf, m.samples, emitted, res, 2, ts_ns,
-                        first, (size_t)batch);
-            tot_payload += wbuf.len;
-
-            /* Two attempts. A connection held across the sleep can have been
-               dropped by the peer, and nothing says so until the write fails
-               -- without the retry every such drop would silently cost a
-               batch, which is exactly what the old code did on any mid-cycle
-               failure. */
-            int code = 0;
-            bool no_conn = false;
-            for (int attempt = 0; attempt < 2 && code <= 0; attempt++) {
+        /* Two attempts. A connection held across the sleep can have been
+           dropped by the peer, and nothing says so until the write fails --
+           without the retry every such drop would silently cost the cycle,
+           which is exactly what the old code did on any mid-cycle failure. */
+        bool no_conn = false;
+        for (int attempt = 0; attempt < 2 && last_code <= 0; attempt++) {
+            if (!conn_alive(&conn)) {
+                conn_close(&conn);      /* release a half-dead fd first */
+                conn_open(&conn, u, auth, now_sec, 8);
                 if (!conn_alive(&conn)) {
-                    conn_close(&conn);      /* release a half-dead fd first */
-                    conn_open(&conn, u, auth, now_sec, 8);
-                    if (!conn_alive(&conn)) {
-                        no_conn = true;
-                        break;
-                    }
-                    /* The very first open of the process is not a reopen;
-                       only a connection the peer took from us is. */
-                    if (had_conn) reopens++;
-                    had_conn = true;
+                    no_conn = true;
+                    break;
                 }
-                code = conn_push(&conn, wbuf.data, wbuf.len);
+                /* The very first open of the process is not a reopen;
+                   only a connection the peer took from us is. */
+                if (had_conn) reopens++;
+                had_conn = true;
             }
-            if (no_conn) {
-                last_code = 0;
-                last_err = conn.err[0] ? conn.err : "connect failed";
-                break;
-            }
-            last_code = code;
-            last_err = code > 0 ? "" : "push error";
-            blks++;
+            last_code = conn_push(&conn, wbuf.data, wbuf.len);
+        }
+        if (no_conn) {
+            last_code = 0;
+            last_err = conn.err[0] ? conn.err : "connect failed";
+        } else if (last_code <= 0) {
+            last_err = "push error";
         }
 
         int ok = last_code >= 200 && last_code < 300;
@@ -282,8 +273,6 @@ static void push_loop(const struct rw_url *u, const char *auth,
         fmt_i64_append(&o, wall_seconds());
         fmt_str_append(&o, " samples=");
         fmt_u64_append(&o, emitted);
-        fmt_str_append(&o, " blks=");
-        fmt_u64_append(&o, blks);
         fmt_str_append(&o, " payloadB=");
         fmt_u64_append(&o, tot_payload);
         fmt_str_append(&o, " pushed=");

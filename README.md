@@ -91,7 +91,6 @@ Configuration is environment-based:
 | `JOB` | no | `integrations/node_exporter` | OTel `service.name` → Prometheus `job` |
 | `INSTANCE` | no | `uname -n` | OTel `service.instance.id` → Prometheus `instance`. Set it when two exporters share a host so they do not collide into one series |
 | `INTERVAL` | no | `15` | Collection/push cycle in seconds |
-| `BATCH` | no | `100` | Samples per OTLP request |
 | `TEXTFILE_DIR` | no | unset | Directory of `*.prom` files to fold into each push; unset disables the collector |
 
 ## 📦 Deploy

@@ -191,9 +191,11 @@ steady-state builds stay no-ops.
 - Loop:
   1. `collect_all()` into a `struct metrics` backed by the cycle arena;
      append `up = 1`.
-  2. Split the `emitted` samples into batches of `BATCH`
-     (`otlp_encode` per batch with `first`/`count`), push over **one**
-     keep-alive connection (`rw_conn`), reopening lazily if the peer dropped it.
+  2. `otlp_encode` the whole `emitted` set and push it as **one** request over
+     **one** keep-alive connection (`rw_conn`), reopening lazily if the peer
+     dropped it. There is no `BATCH` knob: a second layer of chunking only
+     decided how many round trips a cycle cost, and `COLLECT_MAX_SAMPLES`
+     already bounds the request.
   3. `printf("cycle epoch_s=… samples=… blks=… payloadB=… pushed=true http=200")`.
   4. `metrics_free()` → `arena_reset()` (madvise) → `otlp_buf_reset()` →
      `idle_sleep(period_left(deadline))`: evicts the TLS handshake mapping, the
@@ -686,6 +688,6 @@ in "Memory & footprint" above and update the Pi figure in this file.
   unknown (incl. FIPS-mode) endpoints.
 - **`SC_DEBUG`/whichever `--collector.*` flags from the reference exporter are
   gone** — config is env-based (`GW_URL`/`GW_USER`/`GW_PASS` for the
-  gateway, plain `JOB`/`INSTANCE`/`INTERVAL`/`BATCH`/`TEXTFILE_DIR` for the
+  gateway, plain `JOB`/`INSTANCE`/`INTERVAL`/`TEXTFILE_DIR` for the
   rest) plus the four flags listed above.
 - Keep `bin/` free of test artifacts (test binaries live in `build/tests/`).
