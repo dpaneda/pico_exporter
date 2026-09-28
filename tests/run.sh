@@ -287,6 +287,7 @@ fi
 
 # --- hwmon/thermal ---
 check "hwmon temp"                'node_hwmon_temp_celsius\{chip="cpu_thermal",label="cpu_thermal"\} 9\.15'
+check "hwmon temp label"          'node_hwmon_temp_celsius\{chip="cpu_thermal",label="Package id 0"\} 42'
 check "thermal zone"              'node_thermal_zone_temp\{zone="thermal_zone0"\} 9\.15'
 
 # --- filesystem ---

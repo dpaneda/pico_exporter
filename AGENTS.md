@@ -271,8 +271,11 @@ sockstat, udp_queue, hwmon, textfile (if `TEXTFILE_DIR`), systemd (if
 ### OTLP encoder (`src/otlp.c`)
 
 Hand-rolled protobuf with a **dry-run first pass** that counts bytes, then a
-real pass; frames are emitted with 10 reserved length-varint bytes and
-backpatched, so there is never a realloc mid-emit. Fixed nesting:
+real pass. Each frame reserves **one** length-varint byte and `frame_close`
+grows it by exactly the `k-1` extra bytes its varint needs — in both passes
+alike, so the dry count is the *exact* size (no realloc mid-emit, no
+over-allocation) and the real pass slides content by 0 bytes for every frame
+under 128 B instead of always by 9. Fixed nesting:
 
 ```
 ExportMetricsServiceRequest (1) → ResourceMetrics
