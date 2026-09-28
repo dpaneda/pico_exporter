@@ -576,6 +576,20 @@ static void collect_rss(struct metrics *m) {
     }
 }
 
+/* schedstat's first field, not utime+stime from /proc/self/stat: the tick
+   counters are sampled once per CLK_TCK (10 ms on the Pi) and read back in
+   batches, which is coarser than one whole push cycle, so a rate() over them
+   is quantisation noise. schedstat is charged per context switch and resolves
+   in nanoseconds, so rate() is the exporter's real cores. Read with an empty
+   rootfs on purpose, like collect_rss: it is about this process, not the
+   scraped host. */
+static void collect_self_cpu(struct metrics *m) {
+    char *p = (char *)read_proc("", "proc/self/schedstat");
+    if (!p) return;
+    metrics_line(m, "node_exporter_cpu_seconds_total", "",
+                 mv_dbl((double)parse_ll(p) / 1e9));
+}
+
 static void collect_uname(struct metrics *m) {
     struct utsname uts;
     if (uname(&uts) != 0) return;
@@ -689,17 +703,6 @@ static void collect_stat(struct metrics *m) {
                     metrics_line(m, "node_cpu_seconds_total", modes[i],
                                  mv_dbl(d));
                 }
-                /* Every mode except idle and iowait, so that a rate() over
-                   this counter is busy time in millicores directly (one core
-                   = 1000 ms/s), which is why the unit is milliseconds and not
-                   seconds. iowait counts as not-busy, the usual convention;
-                   guest/guest_nice are already inside user/nice, so the eight
-                   parsed modes are the whole of it. */
-                long long busy = parse_ll(toks[1]) + parse_ll(toks[2])
-                               + parse_ll(toks[3]) + parse_ll(toks[6])
-                               + parse_ll(toks[7]) + parse_ll(toks[8]);
-                metrics_line(m, "node_cpu_busy_milliseconds_total", "",
-                             mv_dbl((double)busy * 1000.0 / clk_tick));
             } else if (strcmp(toks[0], "intr") == 0) {
                 metrics_line(m, "node_intr_total", "", mv_str(toks[1]));
             } else if (strcmp(toks[0], "ctxt") == 0) {
@@ -1806,6 +1809,12 @@ void collect_all(struct metrics *m) {
 #ifdef ENABLE_SYSTEMD
     SCRAPE("systemd") collect_systemd(m);
 #endif
+
+    /* Last, so the counter covers the whole collection instead of the empty
+       stretch before it: on-CPU time is charged when the task is scheduled out,
+       so a read taken at the top of the cycle would still report what the
+       previous ones cost, and exactly 0 in a one-shot run. */
+    collect_self_cpu(m);
 
     /* Self-report, and only when non-zero: a permanently-zero series would
        cost a sample slot plus arena on every cycle. metrics_add is used rather

@@ -110,9 +110,13 @@ refute() { # refute <desc> <grep-pattern>
 
 # --- cpu (values use C's shortest round-trip fmt) ---
 check "exporter rss positive"     '^node_exporter_resident_memory_bytes [1-9][0-9]*$'
+# A one-shot lives a couple of ms and the kernel charges on-CPU time when the
+# task is scheduled out, so 0 is the honest value here and is allowed; the
+# counter is only exercised for real growth by the long-running push.
+check "exporter self cpu"         '^node_exporter_cpu_seconds_total ([0-9]+(\.[0-9]+)?|[0-9.]+e[+-][0-9]+)$'
+refute "cpu busy ms gone"         '^node_cpu_busy_milliseconds_total'
 check "cpu aggregate"             'node_cpu_seconds_total\{mode="user"\} (1e\+01|10\.0)'
 check "cpu idle"                  'node_cpu_seconds_total\{mode="idle"\} (5e\+02|500)'
-check "cpu busy ms"               '^node_cpu_busy_milliseconds_total (3\.1e\+04|31000)$'
 check "cpu scaling cur"           'node_cpu_scaling_frequency_hertz\{chip="cpu0"\} (1\.2e\+09|1200000000)'
 check "cpu scaling max"           'node_cpu_scaling_frequency_max_hertz\{chip="cpu0"\} (1\.2e\+09|1200000000)'
 check "cpu scaling min"           'node_cpu_scaling_frequency_min_hertz\{chip="cpu0"\} (6e\+08|600000000)'
@@ -537,27 +541,65 @@ if command -v python3 >/dev/null 2>&1; then
     fail=1
   fi
 
-  # --- batched push (BATCH=100): several frames, all decode ---
+  # --- one request per cycle, and it is the whole sample set ---
   BPORT=$((30000 + RANDOM % 10000))
   rm -f "$DIR/tests/.sink_batch.bin" "$DIR/tests/.sink_batch.bin.conns"
   python3 "$DIR/tests/sink.py" "$DIR/tests/.sink_batch.bin" "$BPORT" &
   BP_SINKD=$!
   sleep 0.5
   GW_URL="http://127.0.0.1:$BPORT/rw" GW_USER="" GW_PASS="" \
-  INSTANCE="testhost" INTERVAL=2 BATCH=100 \
+  INSTANCE="testhost" INTERVAL=2 \
   timeout 7 "$BIN" --path.rootfs="$ROOT" \
     >"$DIR/tests/.push_batch.log" 2>&1
   kill "$BP_SINKD" 2>/dev/null
   wait "$BP_SINKD" 2>/dev/null
-  BLKS="$(grep -ao 'blks=[0-9]*' "$DIR/tests/.push_batch.log" | head -1)"
+  CYCLES="$(grep -c 'pushed=true' "$DIR/tests/.push_batch.log" || true)"
   VB="$(python3 "$DIR/tests/verify_batch.py" "$DIR/tests/.sink_batch.bin" 2>/dev/null || true)"
-  if [ -n "$VB" ] \
-     && [ "$(echo "$VB" | grep -ao 'frames=[0-9]*' | cut -d= -f2)" -ge 4 ] \
-     && [ "$(echo "$VB" | grep -ao 'series=[0-9]*' | cut -d= -f2)" -ge 250 ]; then
-    echo "PASS: batched push (${BLKS:-blks=0} per cycle, sink decoded: $VB)"
+  FRAMES="$(echo "$VB" | grep -ao 'frames=[0-9]*' | cut -d= -f2)"
+  SERIES="$(echo "$VB" | grep -ao 'series=[0-9]*' | cut -d= -f2)"
+  if [ -n "$VB" ] && [ "$SERIES" -ge 250 ] && [ "$FRAMES" -eq "$CYCLES" ]; then
+    echo "PASS: one request per cycle (${CYCLES} cycles, ${FRAMES} frames, $VB)"
   else
-    echo "FAIL: batched push (log: $BLKS, sink: ${VB:-none})"
+    echo "FAIL: expected one frame per cycle (cycles=$CYCLES frames=${FRAMES:-0} sink: ${VB:-none})"
     cat "$DIR/tests/.push_batch.log"
+    fail=1
+  fi
+
+  # The self-CPU counter has to reach the wire, not just the text dump: it is
+  # a monotonic Sum, so a regression to Gauge or to a dropped sample would still
+  # decode as a series. The name is a literal in the protobuf, so a byte match
+  # is enough to prove it shipped.
+  if grep -aq 'node_exporter_cpu_seconds_total' "$DIR/tests/.sink_batch.bin" 2>/dev/null; then
+    echo "PASS: self-CPU counter is on the wire"
+  else
+    echo "FAIL: self-CPU counter missing from the pushed payload"
+    fail=1
+  fi
+
+  # --- INTERVAL is a period, not a delay. The sleep used to be a flat INTERVAL
+  # *after* the work, so the push rate was INTERVAL + the peer's latency:
+  # measured 18.19 s for an INTERVAL of 15, moving with the gateway's latency.
+  # One request per cycle, so the work *is* the delay, and a fast sink would
+  # hide the bug completely -- the delay is the point.
+  DPORT=$((40000 + RANDOM % 10000))
+  rm -f "$DIR/tests/.sink_delay.bin" "$DIR/tests/.sink_delay.bin.conns"
+  SINK_DELAY_MS=800 python3 "$DIR/tests/sink.py" "$DIR/tests/.sink_delay.bin" \
+    "$DPORT" &
+  D_SINKD=$!
+  sleep 0.5
+  GW_URL="http://127.0.0.1:$DPORT/rw" GW_USER="" GW_PASS="" \
+  INSTANCE="testhost" INTERVAL=2 \
+    timeout 13 "$BIN" --path.rootfs="$ROOT" \
+    >"$DIR/tests/.push_delay.log" 2>&1
+  kill "$D_SINKD" 2>/dev/null
+  wait "$D_SINKD" 2>/dev/null
+  PER="$(grep -ao 'epoch_s=[0-9]*' "$DIR/tests/.push_delay.log" | cut -d= -f2 |
+        awk 'NR>1{s+=$1-p; n++} {p=$1} END{if(n) printf "%.2f", s/n}')"
+  if [ -n "$PER" ] && [ "$(awk -v p="$PER" \
+       'BEGIN{print (p>=1.5 && p<=2.25) ? 1 : 0}')" = "1" ]; then
+    echo "PASS: INTERVAL is a period (${PER}s, INTERVAL=2, 800ms peer delay)"
+  else
+    echo "FAIL: cycle period ${PER:-none}s, want ~2.0 (INTERVAL+delay gave 2.8)"
     fail=1
   fi
 

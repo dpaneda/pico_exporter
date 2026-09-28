@@ -176,7 +176,7 @@ static int buf_ensure(struct otlp_buf *b, size_t need) {
     if (b->ar) {
         /* Hot path: the region comes from the cycle arena. Encoding runs after
            collection, so the buffer is normally still the arena's last block
-           and the next batch just extends it in place; otherwise a fresh
+           and the next cycle just extends it in place; otherwise a fresh
            region supersedes it (no free; reclaimed at cycle end). No copy
            either way -- otlp_encode sizes with a dry pass, then rewrites from
            zero. Falls back to malloc only if the arena is exhausted (never in

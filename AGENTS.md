@@ -191,15 +191,33 @@ steady-state builds stay no-ops.
 - Loop:
   1. `collect_all()` into a `struct metrics` backed by the cycle arena;
      append `up = 1`.
-  2. Split the `emitted` samples into batches of `BATCH`
-     (`otlp_encode` per batch with `first`/`count`), push over **one**
-     keep-alive connection (`rw_conn`), reopening lazily if the peer dropped it.
+  2. `otlp_encode` the whole `emitted` set and push it as **one** request over
+     **one** keep-alive connection (`rw_conn`), reopening lazily if the peer
+     dropped it. There is no `BATCH` knob: a second layer of chunking only
+     decided how many round trips a cycle cost, and `COLLECT_MAX_SAMPLES`
+     already bounds the request.
   3. `printf("cycle epoch_s=… samples=… blks=… payloadB=… pushed=true http=200")`.
   4. `metrics_free()` → `arena_reset()` (madvise) → `otlp_buf_reset()` →
-     `idle_sleep(INTERVAL)`: evicts the TLS handshake mapping, the stack
-     below the sleeping frame, the clean `.rodata`/`.data.rel.ro` pages and
-     the whole `.text` except its own page, then `nanosleep`. All raw
+     `idle_sleep(period_left(deadline))`: evicts the TLS handshake mapping, the
+     stack below the sleeping frame, the clean `.rodata`/`.data.rel.ro` pages
+     and the whole `.text` except its own page, then `nanosleep`. All raw
      syscalls, so no other code page is touched. See "Memory & footprint".
+
+     **`INTERVAL` is a period, not a delay.** `deadline` is taken at the top of
+     the cycle off `CLOCK_MONOTONIC` and the sleep is what is left of it, so
+     start-to-start is `INTERVAL` whatever the work cost. It used to sleep a
+     flat `INTERVAL` *after* the work, which made the rate
+     `INTERVAL + work` — and the work is almost all waiting on the peer, not
+     CPU (3.19 s of it against the live gateway at `BATCH=100`, of which 13 ms
+     was CPU), so the scrape rate was 18.19 s for an `INTERVAL` of 15 and it
+     moved with the gateway's latency. Worse, it coupled every optimisation to
+     the opposite effect: a cheaper cycle shortened the period and pushed more
+     often, so `BATCH=1024` came out 12% cheaper per cycle and 2% *more*
+     expensive per second, which is the `rate()` the dashboard shows. Monotonic
+     for the deadline, wall clock for the sample timestamps. `period_left()`
+     floors an overrun at 1 s so a hung peer cannot turn the loop into a spin.
+     `tests/run.sh` gates this with a deliberately slow sink, because a fast
+     one hides it completely.
 
 **The connection is held across cycles, not just across the batches of one
 cycle.** A handshake per cycle was 24.5 ms of the Pi's 41 ms CPU budget, more
@@ -262,10 +280,12 @@ with **2 reserved slots** so `up` and the cap self-report
 hit the cap. A hit cap is *reported* (`ndropped`/`nlabels_capped` → WARN line
 in one-shot modes, extra fields on the cycle line), never swallowed.
 
-Metric families: build_info, own VmRSS, uname, uptime, load, entropy, memory
-(meminfo extras), stat (cpu/busy ms/ctx/intr/forks/procs/boot), disk bytes, filefd,
-filesystem, network counters, vmstat, cpufreq, diskstats, pressure, netstat,
-sockstat, udp_queue, hwmon, textfile (if `TEXTFILE_DIR`), systemd (if
+Metric families: build_info, own VmRSS, own on-CPU
+(`node_exporter_cpu_seconds_total`, from `/proc/self/schedstat` — see
+"Measuring memory" for why not `utime`+`stime`), uname, uptime, load, entropy,
+memory (meminfo extras), stat (cpu/ctx/intr/forks/procs/boot), disk bytes,
+filefd, filesystem, network counters, vmstat, cpufreq, diskstats, pressure,
+netstat, sockstat, udp_queue, hwmon, textfile (if `TEXTFILE_DIR`), systemd (if
 `ENABLE_SYSTEMD`, i.e. `SYSTEMD=1` — not the default).
 
 ### OTLP encoder (`src/otlp.c`)
@@ -668,6 +688,6 @@ in "Memory & footprint" above and update the Pi figure in this file.
   unknown (incl. FIPS-mode) endpoints.
 - **`SC_DEBUG`/whichever `--collector.*` flags from the reference exporter are
   gone** — config is env-based (`GW_URL`/`GW_USER`/`GW_PASS` for the
-  gateway, plain `JOB`/`INSTANCE`/`INTERVAL`/`BATCH`/`TEXTFILE_DIR` for the
+  gateway, plain `JOB`/`INSTANCE`/`INTERVAL`/`TEXTFILE_DIR` for the
   rest) plus the four flags listed above.
 - Keep `bin/` free of test artifacts (test binaries live in `build/tests/`).
