@@ -147,6 +147,10 @@ mk sys/class/hwmon/hwmon0/temp1_input "9150
 "
 mk sys/class/hwmon/hwmon0/temp1_crit "110000
 "
+mk sys/class/hwmon/hwmon0/temp2_input "42000
+"
+mk sys/class/hwmon/hwmon0/temp2_label "Package id 0
+"
 mk sys/class/hwmon/hwmon1/name "rpi_volt
 "
 mk sys/class/thermal/thermal_zone0/temp "9150

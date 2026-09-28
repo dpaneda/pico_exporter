@@ -689,6 +689,17 @@ static void collect_stat(struct metrics *m) {
                     metrics_line(m, "node_cpu_seconds_total", modes[i],
                                  mv_dbl(d));
                 }
+                /* Every mode except idle and iowait, so that a rate() over
+                   this counter is busy time in millicores directly (one core
+                   = 1000 ms/s), which is why the unit is milliseconds and not
+                   seconds. iowait counts as not-busy, the usual convention;
+                   guest/guest_nice are already inside user/nice, so the eight
+                   parsed modes are the whole of it. */
+                long long busy = parse_ll(toks[1]) + parse_ll(toks[2])
+                               + parse_ll(toks[3]) + parse_ll(toks[6])
+                               + parse_ll(toks[7]) + parse_ll(toks[8]);
+                metrics_line(m, "node_cpu_busy_milliseconds_total", "",
+                             mv_dbl((double)busy * 1000.0 / clk_tick));
             } else if (strcmp(toks[0], "intr") == 0) {
                 metrics_line(m, "node_intr_total", "", mv_str(toks[1]));
             } else if (strcmp(toks[0], "ctxt") == 0) {
@@ -904,19 +915,23 @@ static void collect_network(struct metrics *m) {
         strcpy(base, "/sys/class/net");
     struct pdir d;
     if (pdir_open(&d, base) != 0) return;
-    const char *e;
-    size_t nmax = 0;
-    while ((e = pdir_next(&d)) != NULL) nmax++;
-    pdir_close(&d);
-    struct nif *ifs = m_alloc(m, nmax * sizeof *ifs);
-    if (!ifs) return;
+    size_t if_cap = 8;
+    struct nif *ifs = m_alloc(m, if_cap * sizeof *ifs);
+    if (!ifs) { pdir_close(&d); return; }
     int nifs = 0;
-    if (pdir_open(&d, base) != 0) return;
+    const char *e;
     while ((e = pdir_next(&d)) != NULL) {
         if (strcmp(e, ".") == 0 || strcmp(e, "..") == 0 ||
             strcmp(e, "lo") == 0)
             continue;
-        if ((size_t)nifs >= nmax) break;
+        if ((size_t)nifs >= if_cap) {
+            size_t nif_cap = if_cap * 2;
+            struct nif *ifs_new = m_alloc(m, nif_cap * sizeof *ifs_new);
+            if (!ifs_new) break;
+            memcpy(ifs_new, ifs, (size_t)nifs * sizeof *ifs);
+            ifs = ifs_new;
+            if_cap = nif_cap;
+        }
         struct nif *n = &ifs[nifs];
         /* Static storage reused across cycles: clear before filling so a
            statistic that disappears cannot leave the previous value behind. */
@@ -1050,17 +1065,6 @@ static void collect_cpufreq(struct metrics *m) {
     while ((e = pdir_next(&d)) != NULL) {
         if (strncmp(e, "cpu", 3) != 0) continue;
         if (strlen(e) <= 3 || !is_all_digits(e + 3)) continue;
-        char cdir[512];
-        struct sb pb;
-        sb_init(&pb, cdir, sizeof cdir);
-        sb_str(&pb, base);
-        sb_str(&pb, "/");
-        sb_str(&pb, e);
-        sb_str(&pb, "/cpufreq");
-        if (pb.trunc) continue;
-        int cfd = open(cdir, O_RDONLY);
-        if (cfd < 0) continue;
-        close(cfd);
         char chip[128];
         struct sb cb;
         sb_init(&cb, chip, sizeof chip);
@@ -1083,21 +1087,20 @@ static void collect_cpufreq(struct metrics *m) {
             if (!fb.trunc) read_abs(path, outs[i], 128);
         }
 
-        char v[40];
         if (cur[0]) {
-            fmt_f64_shortest(v, (double)parse_ll(cur) * 1000.0);
-            metrics_line(m, "node_cpu_scaling_frequency_hertz", chip, mv_str(v));
-            metrics_line(m, "node_cpufreq_frequency_hertz", chip, mv_str(v));
+            long long val = parse_ll(cur) * 1000;
+            metrics_line(m, "node_cpu_scaling_frequency_hertz", chip, mv_int(val));
+            metrics_line(m, "node_cpufreq_frequency_hertz", chip, mv_int(val));
         }
         if (maxf[0]) {
-            fmt_f64_shortest(v, (double)parse_ll(maxf) * 1000.0);
-            metrics_line(m, "node_cpu_scaling_frequency_max_hertz", chip, mv_str(v));
-            metrics_line(m, "node_cpufreq_frequency_max_hertz", chip, mv_str(v));
+            long long val = parse_ll(maxf) * 1000;
+            metrics_line(m, "node_cpu_scaling_frequency_max_hertz", chip, mv_int(val));
+            metrics_line(m, "node_cpufreq_frequency_max_hertz", chip, mv_int(val));
         }
         if (minf[0]) {
-            fmt_f64_shortest(v, (double)parse_ll(minf) * 1000.0);
-            metrics_line(m, "node_cpu_scaling_frequency_min_hertz", chip, mv_str(v));
-            metrics_line(m, "node_cpufreq_frequency_min_hertz", chip, mv_str(v));
+            long long val = parse_ll(minf) * 1000;
+            metrics_line(m, "node_cpu_scaling_frequency_min_hertz", chip, mv_int(val));
+            metrics_line(m, "node_cpufreq_frequency_min_hertz", chip, mv_int(val));
         }
         if (gov[0]) {
             char l[400];
@@ -1138,43 +1141,13 @@ static void collect_diskstats(struct metrics *m) {
     else
         strcpy(sbase, "/sys/block");
     /* Device names, not paths: the kernel caps them at BDEVNAME_SIZE (32).
-       This was part[256]/parent[256], 8,192 B of the frame. The slot count
-       comes from a first walk of sys/block, since a fixed 16 silently lost the
-       partition-to-parent mapping on a host with more disks than this one. */
+       This was part[256]/parent[256], 8,192 B of the frame. */
     struct paren { char part[32], parent[32]; };
-    size_t pmax = 0;
-    {
-        struct pdir cd;
-        if (pdir_open(&cd, sbase) == 0) {
-            const char *ce;
-            while ((ce = pdir_next(&cd)) != NULL) {
-                /* Same filter as the walk below. Without it this counted the
-                   contents of every loop/ram device -- and of "." and "..",
-                   so it opened and walked all of /sys as well: 27 directory
-                   opens and ~800 entries read per cycle on the Pi to size an
-                   array of 2. */
-                if (skip_blockdev(ce)) continue;
-                char cd2[512];
-                struct sb b;
-                sb_init(&b, cd2, sizeof cd2);
-                sb_str(&b, sbase);
-                sb_str(&b, "/");
-                sb_str(&b, ce);
-                if (b.trunc) continue;
-                struct pdir sd;
-                if (pdir_open(&sd, cd2) != 0) continue;
-                const char *se;
-                while ((se = pdir_next(&sd)) != NULL)
-                    if (is_part_of(se, ce)) pmax++;
-                pdir_close(&sd);
-            }
-            pdir_close(&cd);
-        }
-    }
-    struct paren *par = pmax ? m_alloc(m, pmax * sizeof *par) : NULL;
+    size_t pcap = 16;
+    struct paren *par = m_alloc(m, pcap * sizeof *par);
     int np = 0;
     struct pdir bd;
-    if (pdir_open(&bd, sbase) == 0) {
+    if (par && pdir_open(&bd, sbase) == 0) {
         const char *be;
         while ((be = pdir_next(&bd)) != NULL) {
             if (skip_blockdev(be)) continue;
@@ -1201,13 +1174,19 @@ static void collect_diskstats(struct metrics *m) {
                 int pfd = open(pf, O_RDONLY);
                 if (pfd >= 0) {
                     close(pfd);
-                    if (par && (size_t)np < pmax) {
-                        size_t pl = strlen(pe), bl = strlen(be);
-                        if (pl < sizeof par[0].part && bl < sizeof par[0].parent) {
-                            memcpy(par[np].part, pe, pl + 1);
-                            memcpy(par[np].parent, be, bl + 1);
-                            np++;
-                        }
+                    if ((size_t)np >= pcap) {
+                        size_t npcap = pcap * 2;
+                        struct paren *npar = m_alloc(m, npcap * sizeof *npar);
+                        if (!npar) break;
+                        memcpy(npar, par, (size_t)np * sizeof *par);
+                        par = npar;
+                        pcap = npcap;
+                    }
+                    size_t pl = strlen(pe), bl = strlen(be);
+                    if (pl < sizeof par[0].part && bl < sizeof par[0].parent) {
+                        memcpy(par[np].part, pe, pl + 1);
+                        memcpy(par[np].parent, be, bl + 1);
+                        np++;
                     }
                 }
             }
@@ -1466,40 +1445,64 @@ static void collect_hwmon(struct metrics *m) {
             sb_str(&nb, "/name");
             if (nb.trunc) continue;
             if (read_abs(fname, chip, sizeof chip) <= 0) continue;
-            /* One slot per sensor, counted from the chip directory: a fixed
-               16 dropped sensors on a chip that exposes more. */
+            /* One slot per sensor; the array grows instead of costing a
+               second walk of the chip directory to size it. */
             struct tval { char num[16]; double c; };
+            size_t tcap = 16;
+            struct tval *temps = m_alloc(m, tcap * sizeof *temps);
+            if (!temps) continue;
+            int nt = 0;
             struct pdir cd;
             if (pdir_open(&cd, cdir) != 0) continue;
             const char *fe;
-            size_t tmax = 0;
-            while ((fe = pdir_next(&cd)) != NULL) tmax++;
-            pdir_close(&cd);
-            struct tval *temps = m_alloc(m, tmax * sizeof *temps);
-            if (!temps) continue;
-            int nt = 0;
-            if (pdir_open(&cd, cdir) != 0) continue;
+            /* tempN_label is optional and usually absent: recording which
+               ones the listing showed keeps the read below from paying a
+               failed open per sensor. Only N < 64 is tracked, which no
+               hwmon driver approaches; a higher index falls back to the
+               chip name as an unlabelled sensor would. */
+            uint64_t label_mask = 0;
             while ((fe = pdir_next(&cd)) != NULL) {
                 const char *fn = fe;
-                if (!has_prefix(fn, "temp")) continue;
-                size_t nl = strlen(fn);
-                size_t sl = 6;   /* strlen("_input") */
-                if (nl <= sl || strcmp(fn + nl - sl, "_input") != 0) continue;
-                char num[16], vb[128];
-                size_t nn = nl - sl - 4;
-                memcpy(num, fn + 4, nn);
-                num[nn] = 0;
-                if (nn == 0 || !is_all_digits(num)) continue;
-                if (nn >= sizeof temps[0].num) continue;
-                struct sb tb;
-                sb_init(&tb, fname, sizeof fname);
-                sb_str(&tb, cdir);
-                sb_str(&tb, "/temp");
-                sb_str(&tb, num);
-                sb_str(&tb, "_input");
-                if (tb.trunc) continue;
-                if (read_abs(fname, vb, sizeof vb) <= 0) continue;
-                if ((size_t)nt < tmax) {
+                if (has_prefix(fn, "temp")) {
+                    size_t nl = strlen(fn);
+                    if (nl > 6 && strcmp(fn + nl - 6, "_label") == 0) {
+                        char num[16];
+                        size_t nn = nl - 6 - 4;
+                        if (nn > 0 && nn < sizeof num) {
+                            memcpy(num, fn + 4, nn);
+                            num[nn] = 0;
+                            if (is_all_digits(num)) {
+                                long long nval = parse_ll(num);
+                                if (nval >= 0 && nval < 64) {
+                                    label_mask |= (1ULL << nval);
+                                }
+                            }
+                        }
+                    }
+                    size_t sl = 6;   /* strlen("_input") */
+                    if (nl <= sl || strcmp(fn + nl - sl, "_input") != 0) continue;
+                    char num[16], vb[128];
+                    size_t nn = nl - sl - 4;
+                    memcpy(num, fn + 4, nn);
+                    num[nn] = 0;
+                    if (nn == 0 || !is_all_digits(num)) continue;
+                    if (nn >= sizeof temps[0].num) continue;
+                    struct sb tb;
+                    sb_init(&tb, fname, sizeof fname);
+                    sb_str(&tb, cdir);
+                    sb_str(&tb, "/temp");
+                    sb_str(&tb, num);
+                    sb_str(&tb, "_input");
+                    if (tb.trunc) continue;
+                    if (read_abs(fname, vb, sizeof vb) <= 0) continue;
+                    if ((size_t)nt >= tcap) {
+                        size_t ntcap = tcap * 2;
+                        struct tval *ntemps = m_alloc(m, ntcap * sizeof *ntemps);
+                        if (!ntemps) break;
+                        memcpy(ntemps, temps, (size_t)nt * sizeof *temps);
+                        temps = ntemps;
+                        tcap = ntcap;
+                    }
                     temps[nt].c = (double)parse_ll(vb) / 1000.0;
                     memcpy(temps[nt].num, num, nn + 1);
                     nt++;
@@ -1518,14 +1521,21 @@ static void collect_hwmon(struct metrics *m) {
                 metrics_line(m, "node_hwmon_chip_names", l, mv_int(1));
                 for (int i = 0; i < nt; i++) {
                     char label[256];
-                    struct sb lb;
-                    sb_init(&lb, label, sizeof label);
-                    sb_str(&lb, cdir);
-                    sb_str(&lb, "/temp");
-                    sb_str(&lb, temps[i].num);
-                    sb_str(&lb, "_label");
-                    if (lb.trunc) continue;
-                    if (read_abs(label, label, sizeof label) <= 0) {
+                    long long nval = parse_ll(temps[i].num);
+                    int has_label = (nval >= 0 && nval < 64 && (label_mask & (1ULL << nval)) != 0);
+                    int got_label = 0;
+                    if (has_label) {
+                        struct sb lb;
+                        sb_init(&lb, label, sizeof label);
+                        sb_str(&lb, cdir);
+                        sb_str(&lb, "/temp");
+                        sb_str(&lb, temps[i].num);
+                        sb_str(&lb, "_label");
+                        if (!lb.trunc && read_abs(label, label, sizeof label) > 0) {
+                            got_label = 1;
+                        }
+                    }
+                    if (!got_label) {
                         size_t cl = strlen(chip);
                         if (cl >= sizeof label) cl = sizeof label - 1;
                         memcpy(label, chip, cl);

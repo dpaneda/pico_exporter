@@ -263,7 +263,7 @@ hit the cap. A hit cap is *reported* (`ndropped`/`nlabels_capped` → WARN line
 in one-shot modes, extra fields on the cycle line), never swallowed.
 
 Metric families: build_info, own VmRSS, uname, uptime, load, entropy, memory
-(meminfo extras), stat (cpu/ctx/intr/forks/procs/boot), disk bytes, filefd,
+(meminfo extras), stat (cpu/busy ms/ctx/intr/forks/procs/boot), disk bytes, filefd,
 filesystem, network counters, vmstat, cpufreq, diskstats, pressure, netstat,
 sockstat, udp_queue, hwmon, textfile (if `TEXTFILE_DIR`), systemd (if
 `ENABLE_SYSTEMD`, i.e. `SYSTEMD=1` — not the default).
@@ -271,8 +271,11 @@ sockstat, udp_queue, hwmon, textfile (if `TEXTFILE_DIR`), systemd (if
 ### OTLP encoder (`src/otlp.c`)
 
 Hand-rolled protobuf with a **dry-run first pass** that counts bytes, then a
-real pass; frames are emitted with 10 reserved length-varint bytes and
-backpatched, so there is never a realloc mid-emit. Fixed nesting:
+real pass. Each frame reserves **one** length-varint byte and `frame_close`
+grows it by exactly the `k-1` extra bytes its varint needs — in both passes
+alike, so the dry count is the *exact* size (no realloc mid-emit, no
+over-allocation) and the real pass slides content by 0 bytes for every frame
+under 128 B instead of always by 9. Fixed nesting:
 
 ```
 ExportMetricsServiceRequest (1) → ResourceMetrics

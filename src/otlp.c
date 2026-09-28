@@ -65,26 +65,31 @@ static void emit_fixed64(struct otlp_buf *b, uint64_t bits) {
 static size_t frame_open(struct otlp_buf *b, int field) {
     emit_tag(b, field, WIRE_LEN);
     size_t lenpos = b->len;            /* position of the length varint */
-    for (int i = 0; i < 10; i++) put(b, 0);   /* room for the length varint */
+    put(b, 0);                         /* one byte; frame_close grows it */
     return lenpos;
 }
 
 static void frame_close(struct otlp_buf *b, size_t lenpos) {
-    if (b->dry) return;              /* dry pass: sizes already counted */
-    uint64_t n = (uint64_t)(b->len - lenpos - 10);   /* message content bytes */
+    size_t content = b->len - lenpos - 1;        /* message content bytes */
+    uint64_t n = (uint64_t)content;
+    size_t k = 1;
+    for (uint64_t v = n; v >= 0x80; v >>= 7) k++;
+    /* Both passes grow by the same k-1, so the dry count is the exact size and
+       the real pass never reallocates mid-emit. Growing here instead of
+       reserving the worst-case 10-byte varint up front means the content is
+       slid by the few bytes this varint actually needs, not by 9. */
+    b->len += k - 1;
+    if (b->dry) return;
+    if (k > 1)
+        memmove(b->data + lenpos + k, b->data + lenpos + 1, content);
     char tmp[10];
-    size_t k = 0;
+    size_t t = 0;
     while (n >= 0x80) {
-        tmp[k++] = (char)((n & 0x7F) | 0x80);
+        tmp[t++] = (char)((n & 0x7F) | 0x80);
         n >>= 7;
     }
-    tmp[k++] = (char)n;
+    tmp[t++] = (char)n;
     memcpy(b->data + lenpos, tmp, k);              /* backpatch length */
-    if (b->len - (lenpos + 10) > 0)                /* slide content over room */
-        memmove(b->data + lenpos + k, b->data + lenpos + 10,
-                b->len - (lenpos + 10));
-    n = k;
-    b->len = lenpos + n + (b->len - (lenpos + 10));
 }
 
 static int is_counter_name(const char *name) {
