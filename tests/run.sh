@@ -110,9 +110,13 @@ refute() { # refute <desc> <grep-pattern>
 
 # --- cpu (values use C's shortest round-trip fmt) ---
 check "exporter rss positive"     '^node_exporter_resident_memory_bytes [1-9][0-9]*$'
+# A one-shot lives a couple of ms and the kernel charges on-CPU time when the
+# task is scheduled out, so 0 is the honest value here and is allowed; the
+# counter is only exercised for real growth by the long-running push.
+check "exporter self cpu"         '^node_exporter_cpu_seconds_total ([0-9]+(\.[0-9]+)?|[0-9.]+e[+-][0-9]+)$'
+refute "cpu busy ms gone"         '^node_cpu_busy_milliseconds_total'
 check "cpu aggregate"             'node_cpu_seconds_total\{mode="user"\} (1e\+01|10\.0)'
 check "cpu idle"                  'node_cpu_seconds_total\{mode="idle"\} (5e\+02|500)'
-check "cpu busy ms"               '^node_cpu_busy_milliseconds_total (3\.1e\+04|31000)$'
 check "cpu scaling cur"           'node_cpu_scaling_frequency_hertz\{chip="cpu0"\} (1\.2e\+09|1200000000)'
 check "cpu scaling max"           'node_cpu_scaling_frequency_max_hertz\{chip="cpu0"\} (1\.2e\+09|1200000000)'
 check "cpu scaling min"           'node_cpu_scaling_frequency_min_hertz\{chip="cpu0"\} (6e\+08|600000000)'
@@ -558,6 +562,17 @@ if command -v python3 >/dev/null 2>&1; then
   else
     echo "FAIL: batched push (log: $BLKS, sink: ${VB:-none})"
     cat "$DIR/tests/.push_batch.log"
+    fail=1
+  fi
+
+  # The self-CPU counter has to reach the wire, not just the text dump: it is
+  # a monotonic Sum, so a regression to Gauge or to a dropped sample would still
+  # decode as a series. The name is a literal in the protobuf, so a byte match
+  # is enough to prove it shipped.
+  if grep -aq 'node_exporter_cpu_seconds_total' "$DIR/tests/.sink_batch.bin" 2>/dev/null; then
+    echo "PASS: self-CPU counter is on the wire"
+  else
+    echo "FAIL: self-CPU counter missing from the pushed payload"
     fail=1
   fi
 
