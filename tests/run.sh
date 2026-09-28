@@ -576,6 +576,33 @@ if command -v python3 >/dev/null 2>&1; then
     fail=1
   fi
 
+  # --- INTERVAL is a period, not a delay. The sleep used to be a flat INTERVAL
+  # *after* the work, so the push rate was INTERVAL + the peer's latency:
+  # measured 18.19 s for an INTERVAL of 15, moving with the gateway's latency.
+  # BATCH=1024 keeps it one request so the work is the delay and not 5x it,
+  # and a fast sink would hide the bug completely -- the delay is the point.
+  DPORT=$((40000 + RANDOM % 10000))
+  rm -f "$DIR/tests/.sink_delay.bin" "$DIR/tests/.sink_delay.bin.conns"
+  SINK_DELAY_MS=800 python3 "$DIR/tests/sink.py" "$DIR/tests/.sink_delay.bin" \
+    "$DPORT" &
+  D_SINKD=$!
+  sleep 0.5
+  GW_URL="http://127.0.0.1:$DPORT/rw" GW_USER="" GW_PASS="" \
+  INSTANCE="testhost" INTERVAL=2 BATCH=1024 \
+    timeout 13 "$BIN" --path.rootfs="$ROOT" \
+    >"$DIR/tests/.push_delay.log" 2>&1
+  kill "$D_SINKD" 2>/dev/null
+  wait "$D_SINKD" 2>/dev/null
+  PER="$(grep -ao 'epoch_s=[0-9]*' "$DIR/tests/.push_delay.log" | cut -d= -f2 |
+        awk 'NR>1{s+=$1-p; n++} {p=$1} END{if(n) printf "%.2f", s/n}')"
+  if [ -n "$PER" ] && [ "$(awk -v p="$PER" \
+       'BEGIN{print (p>=1.5 && p<=2.25) ? 1 : 0}')" = "1" ]; then
+    echo "PASS: INTERVAL is a period (${PER}s, INTERVAL=2, 800ms peer delay)"
+  else
+    echo "FAIL: cycle period ${PER:-none}s, want ~2.0 (INTERVAL+delay gave 2.8)"
+    fail=1
+  fi
+
   # --- the connection survives the sleep, not just the batches of one cycle.
   # Several cycles of several batches each must all ride one TCP connection;
   # a regression here costs a full TLS handshake per cycle (24.5 ms of CPU on

@@ -101,6 +101,31 @@ static int64_t now_wall_ns(void) {
     return (int64_t)t.tv_sec * 1000000000 + t.tv_nsec;
 }
 
+/* Monotonic, not the wall clock above: INTERVAL is a duration, and an NTP step
+   mid-sleep would otherwise stretch or cut one period by however far the clock
+   moved. The two deliberately disagree -- the sample timestamps stay on
+   wall time, the deadline does not. */
+static int64_t now_mono_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+/* What is left of the period, which is not the same as INTERVAL: sleeping a
+   flat INTERVAL after the work made the push rate INTERVAL + however long the
+   cycle took, and nearly all of that is waiting on the peer, not CPU. Measured
+   against the live gateway that was 18.19 s for an INTERVAL of 15, and it
+   moved with the gateway's latency, so the scrape rate was neither what was
+   configured nor steady. It also coupled the two halves of every optimisation:
+   making a cycle cheaper shortened the period and pushed more often, which is
+   how a 12%-cheaper cycle still came out 2% more expensive per second.
+   The floor is only for the case where the work overran the period (a hung
+   peer, SO_RCVTIMEO): one second, not a zero, so that cannot become a spin. */
+static long period_left(int64_t deadline) {
+    long left = deadline - now_mono_ms();
+    return left > 0 ? left : 1000;
+}
+
 static int64_t wall_seconds(void) { return (int64_t)time(NULL); }
 
 /* pushMain() port: collects on an INTERVAL cycle and pushes OTLP batches. */
@@ -164,6 +189,7 @@ static void push_loop(const struct rw_url *u, const char *auth,
     for (;;) {
         int64_t ts_ns = now_wall_ns();
         int64_t now_sec = ts_ns / 1000000000;
+        int64_t deadline = now_mono_ms() + interval_ms;
 
         struct metrics m;
         metrics_init(&m, false, rootfs);
@@ -177,7 +203,7 @@ static void push_loop(const struct rw_url *u, const char *auth,
             xwrite(2, msg, sizeof msg - 1);
             metrics_free(&m);
             otlp_buf_reset(&wbuf);
-            idle_sleep(interval_ms);
+            idle_sleep(period_left(deadline));
             continue;
         }
 
@@ -280,7 +306,7 @@ static void push_loop(const struct rw_url *u, const char *auth,
         /* After the resets: the arena has already handed its pages back, and
            idle_sleep evicts what is left -- code, rodata, handshake state,
            the deep stack -- before sleeping. */
-        idle_sleep(interval_ms);
+        idle_sleep(period_left(deadline));
     }
 }
 

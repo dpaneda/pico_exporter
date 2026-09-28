@@ -196,10 +196,26 @@ steady-state builds stay no-ops.
      keep-alive connection (`rw_conn`), reopening lazily if the peer dropped it.
   3. `printf("cycle epoch_s=… samples=… blks=… payloadB=… pushed=true http=200")`.
   4. `metrics_free()` → `arena_reset()` (madvise) → `otlp_buf_reset()` →
-     `idle_sleep(INTERVAL)`: evicts the TLS handshake mapping, the stack
-     below the sleeping frame, the clean `.rodata`/`.data.rel.ro` pages and
-     the whole `.text` except its own page, then `nanosleep`. All raw
+     `idle_sleep(period_left(deadline))`: evicts the TLS handshake mapping, the
+     stack below the sleeping frame, the clean `.rodata`/`.data.rel.ro` pages
+     and the whole `.text` except its own page, then `nanosleep`. All raw
      syscalls, so no other code page is touched. See "Memory & footprint".
+
+     **`INTERVAL` is a period, not a delay.** `deadline` is taken at the top of
+     the cycle off `CLOCK_MONOTONIC` and the sleep is what is left of it, so
+     start-to-start is `INTERVAL` whatever the work cost. It used to sleep a
+     flat `INTERVAL` *after* the work, which made the rate
+     `INTERVAL + work` — and the work is almost all waiting on the peer, not
+     CPU (3.19 s of it against the live gateway at `BATCH=100`, of which 13 ms
+     was CPU), so the scrape rate was 18.19 s for an `INTERVAL` of 15 and it
+     moved with the gateway's latency. Worse, it coupled every optimisation to
+     the opposite effect: a cheaper cycle shortened the period and pushed more
+     often, so `BATCH=1024` came out 12% cheaper per cycle and 2% *more*
+     expensive per second, which is the `rate()` the dashboard shows. Monotonic
+     for the deadline, wall clock for the sample timestamps. `period_left()`
+     floors an overrun at 1 s so a hung peer cannot turn the loop into a spin.
+     `tests/run.sh` gates this with a deliberately slow sink, because a fast
+     one hides it completely.
 
 **The connection is held across cycles, not just across the batches of one
 cycle.** A handshake per cycle was 24.5 ms of the Pi's 41 ms CPU budget, more
