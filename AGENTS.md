@@ -12,18 +12,21 @@ Pi. Every 15 s it reads `/proc` + `/sys` + `statvfs`, builds an
 gateway over TLS. Two hard constraints drive every design decision:
 
 1. **Footprint is the goal.** Resting RSS (between cycles, `smaps_rollup`) is
-   24 kB on the Pi (20-32 kB on x86) — see "Memory & footprint". No `malloc` unless the arena is
-   exhausted (never in production), plus the sh runner (`popen_sh`) in the
-   SYSTEMD=1 build: per-cycle data goes to the arena, everything else to
-   `.bss`, the TLS session mapping, or a mapping `idle_sleep` drops.
+   24 kB on the Pi (20-32 kB on x86) — see "Memory & footprint". There is no
+   allocator at all in the binary: the cycle arena (`ARENA_CAP`, 1 MiB) is the
+   only source of memory, so per-cycle data goes there and everything else to
+   `.bss`, the TLS session mapping, or a mapping `idle_sleep` drops. A
+   collection that does not fit the arena **kills the process** with a message
+   naming the number to raise — deliberately, see "Arena".
 2. **Everything must self-bootstrap.** A fresh clone needs only host base tools
    + network once; BearSSL is fetched (sha256-pinned) and built into the
    gitignored `build/deps/`. There is no libc to bootstrap: the binaries are
    **freestanding** since 26-Sep-2026, compiled against the host/cross gcc's
    headers (declarations only) and linked `-nostdlib -static` with the
    in-repo runtime — `src/start.c` (crt0), `src/freestand.c` (syscall
-   wrappers + mem/str + the popen sh runner), `src/alloc.c` (a first-fit
-   heap) and `src/pico.ld` (the layout idle.c reads back at runtime).
+   wrappers + mem/str + the popen sh runner) and `src/pico.ld` (the layout
+   idle.c reads back at runtime). Memory comes from the cycle arena, so there
+   is no heap implementation to link at all.
 
 Two binary flavors, both static freestanding links (no picolibc since then;
 before that, no glibc):
@@ -46,7 +49,9 @@ src/push.[ch]         URL parse, Basic auth, TCP connect, HTTP/1.1 request +
                       response drain, keep-alive across batches
 src/dns.c             minimal RFC-1035 A-record resolver (UDP, /etc/resolv.conf)
 src/bearglue.[ch]     BearSSL client, session/handshake anon page mappings, one suite
-src/arena.[ch]        mmap + madvise(MADV_DONTNEED) per-cycle arena
+src/arena.[ch]        mmap + madvise(MADV_DONTNEED) per-cycle arena: the
+                      binary's only allocator, fatal when a collection does
+                      not fit
 src/idle.[ch]         drop-then-sleep between cycles: evicts code/rodata/handshake
                       state/deep stack with raw madvise, then raw nanosleep
 src/pdir.[ch]         getdents64 directory iterator (no opendir, no heap)
@@ -55,13 +60,13 @@ src/linux_sock.c      raw socket/syscall shims on the freestanding link
 src/freestand.[ch]    the libc surface: one raw syscall per entry point
                       (open/read/write/close, mmap/madvise, clock_gettime/
                       gettimeofday/time, stat/statvfs), str/mem ops, the
-                      SIGPIPE mask, errno in .bss; popen_sh/pclose_sh replace
+                      SIGPIPE mask, the x86_64 FS base (arch_prctl), errno in
+                      .bss; popen_sh/pclose_sh replace
                       stdio's popen with clone+execve of /bin/sh
 src/start.c           _start (in .init.start), p_main: environ walk, auxv
-                      AT_RANDOM canary seed, exit/abort/__stack_chk_fail/_exit,
+                      AT_RANDOM canary seed + the .bss FS block the x86_64
+                      TLS canaries read, exit/abort/__stack_chk_fail/_exit,
                       getenv
-src/alloc.c           the freestanding heap: address-sorted free list over
-                      anonymous mmap spans, coalescing, ~250 B of text
 src/pico.ld           the links' own layout script: .init (KEEP-sorted, so
                       idle_text_lo stays first) / .text / page-aligned RW
                       (.rodata/.data.rel.ro/.data/.bss); PROVIDEs etext,
@@ -94,21 +99,23 @@ bin/                  built binaries (gitignored)
 
 The user-facing targets are the table in [DEVELOPMENT.md](DEVELOPMENT.md). Two
 exist only for the suite: `make test-bin` (`build/tests/run_tests` +
-`build/tests/pico_exporter-capped` + `build/tests/pico_exporter-systemd`) and
-`make capped` (just the capped one, built with `COLLECT_MAX_SAMPLES=120`).
+`build/tests/pico_exporter-capped` + `build/tests/pico_exporter-tiny` +
+`build/tests/pico_exporter-systemd`), and `make capped` (just the capped one,
+built with `COLLECT_MAX_SAMPLES=120`) / `make tiny` (just the tiny one, built
+with `ARENA_CAP=4096`).
 
 `make aarch64` runs `build.sh`, which delegates the **x86_64 binary to `make`**
 and then does the aarch64 link itself: a **single gcc `-flto` invocation** over
 every production TU — one command is what keeps them all on identical flags
 (`-I$(BEARSSL_INC)` declarations) and avoids the cross-TU libc-mismatch bugs
-of the past — **after compiling the three runtime TUs separately**, because
-`src/start.c`/`freestand.c`/`alloc.c` need `$(FS_FLAGS)`
+of the past — **after compiling the two runtime TUs separately**, because
+`src/start.c`/`freestand.c` need `$(FS_FLAGS)`
 (`-fno-builtin -fno-stack-protector`, their `FS_CFLAGS` override), which one
 gcc invocation cannot carry per TU. Makefile objects for those same files
 carry `FS_CFLAGS` via a target-specific override; keep the two command lines
 identical by construction, not by hope.
 
-**The one deliberate difference: `build.sh` compiles those three TUs without
+**The one deliberate difference: `build.sh` compiles those two TUs without
 `-flto`** (`CORE_CFLAGS` with `-flto=auto` stripped). They are the libc entry
 points, and as LTO IR the cross gcc's `-flto=auto` partitioning dropped their
 definitions from the final link — `undefined reference to memset` (from
@@ -175,10 +182,9 @@ steady-state builds stay no-ops.
   (`lib-native` is the plain no-LTO lib and only feeds `tools/gen_ta.sh`'s
   `brssl ta` tool.)
 - Nothing else. The libc role is filled by src/start.c + src/freestand.c +
-  src/alloc.c + src/pico.ld, compiled with the flags already in the Makefile;
-  there is no picolibc, no meson, no ninja, no libc tarball — and no test
-  exception either: the fmt-vs-picolibc oracle went with picolibc (see
-  "Testing").
+  src/pico.ld, compiled with the flags already in the Makefile; there is no
+  picolibc, no meson, no ninja, no libc tarball — and no test exception
+  either: the fmt-vs-picolibc oracle went with picolibc (see "Testing").
 
 ## Runtime
 
@@ -250,10 +256,11 @@ One function per metric family, in a fixed order (`collect_all`); several are
 wrapped in `SCRAPE(name)` which reports `node_scrape_collector_*_seconds` /
 `_success` for each. Reads go through `read_proc()`, which uses `open`/`read`
 (never stdio) and **reads files to EOF** into a growable buffer carved from
-the cycle arena (4 kB to start, doubling; a one-off malloc in the one-shot
-modes, which have no arena) — fixed-size slices silently truncate, which is
+the cycle arena (4 kB to start, doubling) — fixed-size slices silently
+truncate, which is
 how a 300-socket `/proc/net/udp` once reported 63. Directory listings go
-through `pdir` (`getdents64`), never `opendir`/`readdir`: malloc. No stdio
+through `pdir` (`getdents64`), never `opendir`/`readdir`: malloc, of which
+there is none. No stdio
 anywhere (issue #2): values are emitted as tagged `mval`s — the number the
 collector already has (MV_INT/MV_UINT/MV_DBL) or the raw /proc token
 (MV_STR, e.g. loadavg). Push mode stores the double directly; the text
@@ -263,7 +270,10 @@ exception was the systemd flavor: popen is stdio by construction, so it uses
 `src/freestand.c`) and reads the pipe with `read()` into a doubling buffer
 instead of `fgets`.
 
-Output modes:
+Output modes. All three run on the arena — `metrics_init(m, ar, …)` takes it
+as a parameter, because there is no path that can collect without one; the
+push loop passes the arena it resets each cycle, the one-shot modes a local
+one that lives for their single collection.
 
 - **text** (`--metrics-once`): `metrics_line()` appends ready-formatted
   `name{k="v",…} value` lines. MV_DBL values go through `fmt_f64_shortest`
@@ -307,8 +317,13 @@ ExportMetricsServiceRequest (1) → ResourceMetrics
                      as_double (4) fixed64
 ```
 
-The encoder reads `msample[]` directly (no per-cycle mirror copy). The OTLP
-round-trip in the harness is the wire gate — no frozen golden fixtures.
+The encoder reads `msample[]` directly (no per-cycle mirror copy) and its
+buffer has one allocation path, the arena (`buf_ensure()` calls
+`arena_extend`, then `arena_alloc`, which dies if the arena is full), so there
+is no `owned` flag to keep in sync any more. The OTLP round-trip in the
+harness is the wire gate — and it runs on an arena too, so the case the
+service cannot take stays the case the harness cannot take — no frozen golden
+fixtures.
 
 ### Push (`src/push.c`) + DNS (`src/dns.c`)
 
@@ -333,7 +348,8 @@ because `br_x509_minimal_init` rewrites it before each handshake and
 BearSSL, with `BR_OPT_NO_RENEGOTIATION`, only reads it during one (the
 harness `fallback` case zero-fills it mid-connection and requires the next
 request to succeed). `g_ioc`, the seed and the pointers stay in `.bss`. No
-TLS state on the heap: the oversized-record fallback buffer is an `mmap` too.
+TLS state comes from an allocator: the oversized-record fallback buffer is an
+`mmap` too.
 
 - One suite: `BR_TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`; one curve:
   `br_ec_p256_m15`; RSA PKCS#1 verify for the ServerKeyExchange.
@@ -356,7 +372,27 @@ TLS state on the heap: the oversized-record fallback buffer is an `mmap` too.
 MADV_DONTNEED)` + offset 0. Pages are re-faulted next cycle, so arena bytes
 cost nothing *at rest* — but every page the cycle touches is a real fault and
 a real page while the cycle runs, which is the exporter's true peak.
-`metrics_free` also frees any malloc fallback escapes (`heap_samples`).
+`metrics_free` is a rewind and nothing else: every sample, label and
+collector scratch array of the cycle came out of here.
+
+**Exhaustion is fatal, by decision.** `arena_alloc()` is the only refusal
+point: it prints `arena exhausted: need N B, X of Y B in use (raise
+ARENA_CAP)` on stderr and `exit(1)`. `arena_extend()` still returns NULL when
+the block it is asked to grow is not the arena's last one — the caller then
+carves a fresh block, and that `arena_alloc()` is where a genuinely full arena
+dies. The reasoning: the fallback allocator this replaced (a first-fit heap
+over mmap spans in `src/alloc.c`, deleted 28-Sep-2026) was never going to run
+on a real host, and when it did run it was *worse* than dying — measured on the
+dev host with a 3000-interface /proc/net/dev, it retained 3.4 MB between
+cycles, the retained bytes were never returned, and a collection that did fit
+the arena had the same fault count as one that did not. So the failure mode is
+now a loud death whose message says which knob to turn, and the unit's
+`Restart=` policy decides what happens next. What this costs: measured
+exhaustion of the 1 MiB cap is ~800 mounts or ~800 interfaces (1.83 MB for
+1100 interfaces, 3.08 MB for 1400 mounts), so a host past that needs a bigger
+`ARENA_CAP` — which is a one-line change, and the only reason it is not the
+default. The `build/tests/pico_exporter-tiny` build (`ARENA_CAP=4096`) is what
+keeps the refusal honest.
 
 Two rules the size and the flags encode:
 
@@ -483,7 +519,7 @@ grep -E "VmRSS|RssAnon|RssFile" /proc/$P/status
 | rodata/data | 4 kB | the dirty page: `.rodata` tail, `.data.rel.ro`, `__tls_space`, `.data`, small `.bss`; aarch64 measured 8 kB until 2026-09-25 (an extra `.eh_frame`/`.except_unordered` page) and 4 kB on 2026-09-27 |
 | TLS session mapping | 8 kB | `br_ssl_client_context` + record buffer, alive across the keep-alive sleep |
 | stack | 8-12 kB | env/auxv page(s) plus the `main`/`push_loop` frame; deeper pages are dropped |
-| heap | 0 | no `malloc` unless the arena is exhausted (never in production), plus `popen` in the SYSTEMD=1 build |
+| heap | 0 | there is no heap: `src/alloc.c` is gone, so nothing can `brk` |
 | TLS handshake mapping | 0 | dropped each idle, refilled on the next handshake |
 | arena | 0 | `MADV_DONTNEED` each cycle (unchanged) |
 
@@ -583,9 +619,12 @@ suite actually covers:
   assertions on names/labels/**values** for every export, a 300-socket
   `/proc/net/udp` to prove whole-table reads, cap self-report via
   `build/tests/pico_exporter-capped` (`COLLECT_MAX_SAMPLES=120`,
-  `SYSTEMD=0`), and — against `build/tests/pico_exporter-systemd`, since the
-  default build has no systemd collector — systemd count consistency with the
-  live host.
+  `SYSTEMD=0`); the fatal arena refusal via `build/tests/pico_exporter-tiny`
+  (`ARENA_CAP=4096`), which must exit non-zero, print the `need/of/in use`
+  message with the knob, and leave **nothing on stdout** — a truncated
+  exposition would read as a smaller host; and — against
+  `build/tests/pico_exporter-systemd`, since the default build has no systemd
+  collector — systemd count consistency with the live host.
 - **Harness** `build/tests/run_tests` subcommands:
   - `tls` — live endpoint: valid chain, 405 on bare GET, stale-clock rejection;
   - `tls-bad` — wrong trust anchor must fail (62);
@@ -617,7 +656,11 @@ suite actually covers:
   sleeps between cycles against the http sink): `smaps_rollup` Rss <= 32 kB,
   no `[heap]` mapping, minor faults over two cycles <= 320 — all gated on the
   exporter still being alive (`kill -0`), so a crash fails loudly instead of
-  passing on absent files.
+  passing on absent files. The `[heap]` check is the cheap half of the
+  "no allocator" claim: it catches a `brk`-backed malloc, but the deleted
+  freestanding heap used anonymous `mmap` chunks, so a reinstated one would slip
+  past it — the arena is visible in `smaps_rollup` as a 1 MiB mapping and the
+  RSS number is what actually proves the steady state.
 - **Layout invariant** (`tests/run.sh`, before the fake-root run, on
   `bin/pico_exporter` and, if built, the aarch64 binary): `readelf` must show
   no relocations and no writable section other than `.data.rel.ro` inside
@@ -647,10 +690,11 @@ in "Memory & footprint" above and update the Pi figure in this file.
   PR description and let him decide.
 - **No comments unless they explain a non-obvious decision** — the existing
   code comments are all such justification comments; match that tone.
-- **No `malloc` unless the arena is exhausted (never in production), plus
-  the sh runner in the SYSTEMD=1 build** (`tests/run.sh` fails on a `[heap]`
-  mapping; the freestanding `malloc` in src/alloc.c never maps `[heap]` —
-  its chunks are anonymous mmaps). Per-cycle data goes to the arena; state
+- **There is no allocator.** `src/alloc.c` (the first-fit heap over mmap
+  spans) is deleted: the cycle arena is the only source of memory, and running
+  out of it is fatal rather than a `malloc` escape hatch, because that escape
+  hatch is exactly what a silently incomplete push looks like from the
+  gateway's side. Per-cycle data goes to the arena; state
   that must survive the sleep goes to `.bss` or the TLS session mapping;
   state dead at idle goes to a mapping `idle_sleep` drops. Read `/proc` and
   `/sys` with `open`/`read` and directories with `pdir`, never stdio/dirent.

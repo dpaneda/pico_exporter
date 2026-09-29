@@ -44,7 +44,6 @@ int  bg_handshake(const char *host, int fd, uint32_t days, uint32_t secs);
 int  bg_write_all(const unsigned char *buf, int len);   /* 0 ok, -1 on failure */
 int  bg_read_some(unsigned char *buf, int len);         /* bytes or <= 0 */
 void bg_close(void);
-int  bg_last_error(void);   /* br_ssl_engine_last_error */
 int  bg_iobuf_size(void);   /* current I/O buffer size */
 int  bg_grow_iobuf(void);   /* 1 if it grew: retry the handshake */
 

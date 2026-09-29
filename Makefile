@@ -1,7 +1,8 @@
 # Makefile - pico_exporter. Both binaries are freestanding: compiled against
 # the host/cross cc's own headers for declarations only, and linked
 # -nostdlib -static with src/pico.ld + the in-repo runtime in src/start.c,
-# src/freestand.c and src/alloc.c ( Ersatz of crt0 + syscall wrappers + libc).
+# src/freestand.c (Ersatz of crt0 + syscall wrappers + libc). The only
+# allocator is the cycle arena (src/arena.c): there is no heap to link.
 # Only BearSSL is an external dependency. build.sh does the aarch64 link,
 # reading its flags back out of this file.
 #
@@ -116,9 +117,9 @@ BEARSSL_LIB ?= build/deps/bearssl/lib-x86_64/libbearssl.a
 # Static freestanding link line, shared by the service and the
 # service-shaped test binaries (run_tests is an ordinary glibc binary; see
 # below). src/start.c provides _start/environ/exit, src/freestand.c the
-# syscall wrappers and libc ops, src/alloc.c the heap, src/pico.ld the
-# layout idle.c's evictions read back at runtime.
-FS_OBJS = src/start.o src/freestand.o src/alloc.o
+# syscall wrappers and libc ops, src/pico.ld the layout idle.c's evictions read
+# back at runtime. Memory comes from the cycle arena, so there is no heap object.
+FS_OBJS = src/start.o src/freestand.o
 
 STATIC_LINK = -s -Wl,--gc-sections \
               -Wl,--build-id=none -Wl,-z,max-page-size=0x1000 \
@@ -127,7 +128,7 @@ STATIC_LINK = -s -Wl,--gc-sections \
 
 SRCS = src/pico_exporter.c src/push.c src/otlp.c src/collectors.c src/fmt.c \
        src/arena.c src/dns.c src/linux_sock.c src/bearglue.c \
-       src/pdir.c src/idle.c src/start.c src/freestand.c src/alloc.c
+       src/pdir.c src/idle.c src/start.c src/freestand.c
 OBJS = $(SRCS:.c=.o)
 
 BIN = bin/pico_exporter
@@ -183,9 +184,9 @@ TEST_CFLAGS = $(filter-out -mstack-protector-guard=global $(TA_DEF),$(CFLAGS))
 # oversized-record recovery, keepalive, OTLP round-trip). See tests/run_tests.c.
 # The harness is an ordinary glibc binary (full stdio, strtod, qsort...), so
 # unlike the service builds it links libc normally and defines nothing from
-# src/freestand.c/start.c/alloc.c.
+# src/freestand.c/start.c.
 test-bin: $(TESTBIN)/run_tests $(TESTBIN)/pico_exporter-capped \
-	$(TESTBIN)/pico_exporter-systemd
+	$(TESTBIN)/pico_exporter-tiny $(TESTBIN)/pico_exporter-systemd
 
 # The harness must always validate: its TLS cases assert wrong-anchor rejection,
 # which an insecure build cannot produce.
@@ -218,6 +219,24 @@ $(TESTBIN)/pico_exporter-capped: $(SRCS) $(FS_OBJS) $(BEARSSL_LIB) src/pico.ld
 		src/arena.c src/dns.c src/linux_sock.c src/bearglue.c src/pdir.c \
 		src/idle.c $(FS_OBJS) $(BEARSSL_LIB) $(STATIC_LINK) -o $@
 
+# Tiny-arena build: a collection that does not fit the arena is fatal, and a
+# 1 MiB arena cannot be exhausted on any host small enough to test on. This is
+# the only way to check that the refusal is the loud, self-describing death it
+# is meant to be -- a silently truncated push or a heap fallback is exactly what
+# the arena replaced, and neither shows up anywhere else in the suite.
+# Service-shaped (freestanding), no systemd so the failure is reached during
+# the first collector either way.
+tiny: $(TESTBIN)/pico_exporter-tiny
+$(TESTBIN)/pico_exporter-tiny: SYSTEMD = 0
+$(TESTBIN)/pico_exporter-tiny: INSECURE = 0
+$(TESTBIN)/pico_exporter-tiny: $(SRCS) $(FS_OBJS) $(BEARSSL_LIB) src/pico.ld
+	@mkdir -p $(TESTBIN)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE -D__PICO_FREESTAND__ \
+		-I$(BEARSSL_INC) -DARENA_CAP=4096 \
+		src/pico_exporter.c src/push.c src/otlp.c src/collectors.c src/fmt.c \
+		src/arena.c src/dns.c src/linux_sock.c src/bearglue.c src/pdir.c \
+		src/idle.c $(FS_OBJS) $(BEARSSL_LIB) $(STATIC_LINK) -o $@
+
 # systemd-enabled build for the node_systemd_units assertions. SYSTEMD is off in
 # the default build, so without this binary the collector would ship untested.
 # Service-shaped (freestanding): this is where the fork/exec popen_sh/pclose_sh
@@ -236,7 +255,7 @@ $(TESTBIN)/pico_exporter-systemd: $(SRCS) $(FS_OBJS) $(BEARSSL_LIB) src/pico.ld
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(FS_CFLAGS) $(DEPFLAGS) -D_GNU_SOURCE \
 		-D__PICO_FREESTAND__ -I$(BEARSSL_INC) -c $< -o $@
 
-src/start.o src/freestand.o src/alloc.o: FS_CFLAGS = $(FS_FLAGS)
+src/start.o src/freestand.o: FS_CFLAGS = $(FS_FLAGS)
 
 -include $(OBJS:.o=.d)
 
@@ -250,10 +269,11 @@ debug: $(BIN)
 # `make distclean` to drop it.
 clean:
 	rm -f $(OBJS) $(OBJS:.o=.d)
+	rm -f build/fs/*.o build/fs/*.d
 	rm -f $(BIN) bin/pico_exporter-aarch64 $(FLAGS_STAMP)
 	rm -rf $(TESTBIN)
 	rm -rf tests/.fake tests/.fake_big tests/.M.txt tests/.capped.log \
-		tests/.metrics.log tests/.sink.bin \
+		tests/.tiny.out tests/.tiny.log tests/.metrics.log tests/.sink.bin \
 		tests/.sink_batch.bin tests/.sink_keepalive.bin \
 		tests/.sink_onetime.bin tests/.sink*.bin.conns \
 		tests/.push.log tests/.push_batch.log tests/.push_onetime.log

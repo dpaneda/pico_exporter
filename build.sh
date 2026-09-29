@@ -11,12 +11,13 @@
 # aarch64-specific: the cross compiler and the short sequence below.
 #
 # Nothing is fetched but BearSSL (pinned by tools/bearssl_env.sh into
-# build/deps/bearssl): the in-repo runtime in src/start.c, src/freestand.c,
-# src/alloc.c and src/pico.ld replaces what libc used to provide, so the
-# only outside package this link needs is the cross gcc itself.
+# build/deps/bearssl): the in-repo runtime in src/start.c, src/freestand.c and
+# src/pico.ld replaces what libc used to provide -- the cycle arena (src/arena.c)
+# is the allocator, so there is no heap implementation at all -- which makes the
+# only outside package this link needs the cross gcc itself.
 #
-# Why three TUs compile *outside* the single command: src/start.c,
-# src/freestand.c and src/alloc.c (FS_OBJS in the Makefile) define libc
+# Why two TUs compile *outside* the single command: src/start.c and
+# src/freestand.c (FS_OBJS in the Makefile) define libc
 # entry-point names and run before the stack guard is seeded, so they take
 # the Makefile's $(FS_FLAGS) (-fno-builtin, -fno-stack-protector); a single
 # gcc invocation cannot carry per-TU flags. The dev build compiles them as
@@ -103,7 +104,7 @@ for f in $FS_OBJS; do
 done
 SRCS_MAIN=()
 for s in $SRCS; do
-  case "$s" in src/start.c|src/freestand.c|src/alloc.c) continue ;; esac
+  case "$s" in src/start.c|src/freestand.c) continue ;; esac
   SRCS_MAIN+=("$s")
 done
 

@@ -29,10 +29,10 @@ struct mkv {
 };
 
 /* `labels` points at exactly nlabels pairs carved from the same per-cycle
-   storage as the strings (arena in push mode, tracked malloc otherwise), and
-   is NULL when nlabels == 0. Holding the array out of line is what keeps the
-   struct at 32 bytes: an inline mkv[8] cost 128 of 152 bytes for a population
-   where 59% of samples carry no labels at all and 98% carry at most two. */
+   storage as the strings (the cycle arena), and is NULL when nlabels == 0.
+   Holding the array out of line is what keeps the struct at 32 bytes: an
+   inline mkv[8] cost 128 of 152 bytes for a population where 59% of samples
+   carry no labels at all and 98% carry at most two. */
 struct msample {
     const char *name;
     const struct mkv *labels;
@@ -44,26 +44,19 @@ struct metrics {
     bool       text_mode;
     const char *rootfs;          /* "" or a trailing-slash path */
 
-    /* per-cycle arena (samples mode only); NULL means plain malloc */
+    /* Per-cycle storage. Every mode has one: the push loop owns it for the
+       life of the process, the one-shot modes own it for one collection. The
+       arena is the only allocator, so a sample, a label string or a collector's
+       scratch array is carved from it and reclaimed by arena_reset. */
     struct arena *ar;
-
-    /* owned label/name strings. Normally only the non-arena samples mode
-       (one-shot --dump) uses these, but arena mode also lands here for the
-       malloc fallbacks it takes when the arena is exhausted, so sfree[] must
-       be released on every path. */
-    char     **sfree;
-    size_t     nsfree, capsf;
 
     /* text sink */
     char      *txt;
     size_t     tlen, tcap;
 
-    /* samples sink. heap_samples marks `samples` as malloc/realloc-owned:
-       always true in non-arena mode, and in arena mode after an
-       arena-exhaustion fallback (arena_reset does not cover it). */
+    /* samples sink */
     struct msample *samples;
     size_t     n, scap;
-    bool       heap_samples;
 
     /* Per-cycle self-report: samples the cap refused, and samples whose label
        list was truncated. Counted, then reported once per cycle -- a message
@@ -73,15 +66,15 @@ struct metrics {
     size_t     nlabels_capped;
 };
 
-/* Points the shared /proc read buffer at the cycle arena (push mode). Unset
-   -- the one-shot modes -- keeps it on a one-off malloc. */
-void collectors_set_arena(struct arena *ar);
-
 /* Directory scanned for `*.prom` files (TEXTFILE_DIR). NULL or empty
    disables the collector entirely. */
 void collectors_set_textfile_dir(const char *dir);
 
-void metrics_init(struct metrics *m, bool text_mode, const char *rootfs);
+/* `ar` is the mode's arena and is required: the push loop's (reset every
+   cycle) or a local one living for a single one-shot collection. It also
+   backs the shared /proc read buffer. */
+void metrics_init(struct metrics *m, struct arena *ar, bool text_mode,
+                  const char *rootfs);
 void metrics_free(struct metrics *m);
 
 /* Tagged sample value (issue #2 step 1): collectors emit the number they

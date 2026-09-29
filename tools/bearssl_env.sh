@@ -9,8 +9,8 @@
 # pinned tarball. Nothing outside the repo is touched.
 #
 # BearSSL is the repo's single external dependency. The libc that used to be
-# picolibc is now in-repo (src/start.c + src/freestand.c + src/alloc.c +
-# src/pico.ld), built against the compilers that are already here, so there is
+# picolibc is now in-repo (src/start.c + src/freestand.c + src/pico.ld),
+# built against the compilers that are already here, so there is
 # no libc bootstrap at all. (musl and glibc cross builds were removed
 # 18/19-Sep-2026; picolibc itself, and meson with it, on 26-Sep-2026.)
 

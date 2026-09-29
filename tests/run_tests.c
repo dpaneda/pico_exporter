@@ -608,7 +608,15 @@ static int cmd_encode(int argc, char **argv) {
     int ns = read_samples(samples, COLLECT_MAX_SAMPLES);
     if (ns < 0) return 2;
 
-    struct otlp_buf out = {0};
+    /* The service has no heap, so neither does the harness's encode case: the
+       wire buffer comes off an arena, sized for the biggest request the test
+       parameters can describe. */
+    struct arena ar;
+    if (arena_init(&ar, 4u << 20) != 0) {
+        fprintf(stderr, "encode: arena_init failed\n");
+        return 2;
+    }
+    struct otlp_buf out = { .ar = &ar };
     size_t got = otlp_encode(&out, samples, (size_t)ns, res, res_n, ts_ns,
                              first, count);
 
@@ -622,7 +630,6 @@ static int cmd_encode(int argc, char **argv) {
     }
 
     if (got == 0) {   /* legitimately empty slice */
-        if (out.owned) free(out.data);
         printf("encode: OK (%d samples, slice [%zu,%zu), 0 datapoints)\n",
                ns, first, last);
         return 0;
@@ -725,7 +732,7 @@ static int cmd_encode(int argc, char **argv) {
             }
             free((void *)samples[i].labels);
         }
-    if (out.owned) free(out.data);
+    arena_reset(&ar);
 
     if (fails) {
         printf("encode: %d FAILURES\n", fails);

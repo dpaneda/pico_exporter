@@ -28,13 +28,18 @@
 
 /* Per-cycle arena size: virtual mapping backed by anonymous memory, evicted
    with MADV_DONTNEED each cycle. A 633-sample collection reaches ~113 kB of
-   it, so this is ~9x headroom; a pathological >cap collection falls back to
-   malloc but that never happens in production. Deliberately under 2 MiB: a
+   it, so this is ~9x headroom. It is also the whole of the process's
+   per-cycle memory: a collection that does not fit is fatal (arena.c), not
+   quietly reallocated, because the heap is exactly what the idle-footprint
+   work removed. Measured exhaustion: ~800 mounts or ~800 interfaces, so a
+   host past that needs a bigger number here. Deliberately under 2 MiB: a
    larger mapping is eligible for a transparent hugepage, and on a THP
    `always` kernel the first byte touched then faults 2 MiB at once, turning a
    113 kB cycle into a 2 MiB RSS spike. arena_init also asks for
    MADV_NOHUGEPAGE. */
+#ifndef ARENA_CAP
 #define ARENA_CAP (1u << 20)
+#endif
 
 /* write-all to a fd (EINTR-safe). */
 static void xwrite(int fd, const char *buf, size_t n) {
@@ -169,8 +174,11 @@ static void push_loop(const struct rw_url *u, const char *auth,
     res[1].v = inst;
 
     struct arena ar;
-    arena_init(&ar, ARENA_CAP);
-    collectors_set_arena(&ar);
+    if (arena_init(&ar, ARENA_CAP) != 0) {
+        static const char msg[] = "pico_exporter: arena_init failed\n";
+        xwrite(2, msg, sizeof msg - 1);
+        exit(1);
+    }
     struct otlp_buf wbuf = { .ar = &ar };
 
     /* Held across cycles, not merely across the one request of a cycle. The
@@ -189,8 +197,7 @@ static void push_loop(const struct rw_url *u, const char *auth,
         int64_t deadline = now_mono_ms() + interval_ms;
 
         struct metrics m;
-        metrics_init(&m, false, rootfs);
-        m.ar = &ar;
+        metrics_init(&m, &ar, false, rootfs);
         collect_all(&m);
         metrics_add(&m, "up", 1.0);
         size_t emitted = m.n;
@@ -328,9 +335,19 @@ int main(int argc, char **argv) {
 
     collectors_set_textfile_dir(getenv("TEXTFILE_DIR"));
 
+    /* The one-shot modes collect exactly once, so their arena lives here: same
+       cap, no cycle, released with the process. They are the modes a human
+       runs against a big host, so the fatal path is the one they hit first. */
+    struct arena ar;
+    if (arena_init(&ar, ARENA_CAP) != 0) {
+        static const char msg[] = "pico_exporter: arena_init failed\n";
+        xwrite(2, msg, sizeof msg - 1);
+        return 1;
+    }
+
     if (dump_once) {
         struct metrics m;
-        metrics_init(&m, true, rootfs);
+        metrics_init(&m, &ar, true, rootfs);
         collect_all(&m);
         /* The text buffer is complete; one write loop replaces fwrite. */
         size_t off = 0;
@@ -346,7 +363,7 @@ int main(int argc, char **argv) {
     }
     if (dump) {
         struct metrics m;
-        metrics_init(&m, false, rootfs);
+        metrics_init(&m, &ar, false, rootfs);
         collect_all(&m);
         metrics_dump(&m, dump);
         report_capped(&m);

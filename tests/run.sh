@@ -327,6 +327,33 @@ if [ -x "$SYSDBIN" ]; then
     echo "FAIL: per-unit detail removed"
     fail=1
   else
+# A collection that does not fit the arena must die loudly and name the knob,
+# not truncate the push and not fall back to a heap. build/tests/pico_exporter-tiny
+# is the same code built with ARENA_CAP=4096, one page, because the real 1 MiB
+# cannot be exhausted by anything a test host has.
+TINYBIN="$DIR/build/tests/pico_exporter-tiny"
+if [ -x "$TINYBIN" ]; then
+  "$TINYBIN" --path.rootfs="$DIR/tests/.fake" --metrics-once \
+      >"$DIR/tests/.tiny.out" 2>"$DIR/tests/.tiny.log"
+  TINYRC=$?
+  TINYLOG="$(cat "$DIR/tests/.tiny.log")"
+  # Non-zero, nothing on stdout (a truncated exposition would be read as a
+  # smaller host), and a message that says what was needed and which knob to
+  # turn -- the operator has to be able to tell "raise the cap" from "this
+  # host is broken".
+  if [ "$TINYRC" = "1" ] && [ ! -s "$DIR/tests/.tiny.out" ] &&
+     grep -q 'arena exhausted: need .* of .* B in use' "$DIR/tests/.tiny.log" &&
+     grep -q 'raise ARENA_CAP' "$DIR/tests/.tiny.log"; then
+    echo "PASS: exhausted arena is fatal, no partial output (rc=1; $TINYLOG)"
+  else
+    echo "FAIL: exhausted arena not fatal (rc=$TINYRC want 1, stdout $(wc -c <"$DIR/tests/.tiny.out") B want 0, log: $TINYLOG)"
+    fail=1
+  fi
+  rm -f "$DIR/tests/.tiny.out" "$DIR/tests/.tiny.log"
+else
+  echo "SKIP: build/tests/pico_exporter-tiny missing (run make test)"
+fi
+
     echo "PASS: per-unit detail removed"
   fi
   hostUnits="$(systemctl list-units --all --type=service --plain --no-legend --no-pager | wc -l)"
@@ -522,7 +549,7 @@ if command -v python3 >/dev/null 2>&1; then
     if [ "${HEAPS:-0}" -eq 0 ]; then
       echo "PASS: no [heap] mapping"
     else
-      echo "FAIL: [heap] mapping present (malloc ran in a push mode steady state)"
+      echo "FAIL: [heap] mapping present (a brk-backed allocation ran in a push mode steady state)"
       fail=1
     fi
     # Two INTERVAL=2 cycles fit in the ~4.4 s window; 16 per cycle measured
@@ -534,6 +561,12 @@ if command -v python3 >/dev/null 2>&1; then
       echo "PASS: minor faults over two cycles = $FAULTS (<= 320)"
     else
       echo "FAIL: minor faults over two cycles = $FAULTS (want 0..320)"
+  # The steady state has no allocator to leak into: brk would show up as
+  # [heap] and mmap'd chunks as an anonymous mapping of their own. This gate is
+  # cheap rather than sharp -- the arena's mmap is 1 MiB and madvise'd away
+  # between cycles, so a fallback allocator using its own mmap would slip past
+  # it -- but it still catches a brk-backed malloc, and the arena's presence
+  # and size are what the RSS number above proves.
       fail=1
     fi
   else
