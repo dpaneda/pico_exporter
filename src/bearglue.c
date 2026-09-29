@@ -290,10 +290,6 @@ void bg_close(void) {
     g_fd = -1;
 }
 
-int bg_last_error(void) {
-    return g_ss ? br_ssl_engine_last_error(&g_ss->cc.eng) : -1;
-}
-
 int bg_iobuf_size(void) { return (int)g_buflen; }
 
 int bg_session_id_len(void) {

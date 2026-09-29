@@ -9,7 +9,6 @@
 #ifdef __PICO_FREESTAND__
 
 #include <errno.h>
-#include <stdint.h>
 #include <sys/socket.h>
 #include <sys/utsname.h>
 

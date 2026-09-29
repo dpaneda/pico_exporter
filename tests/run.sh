@@ -79,6 +79,44 @@ if [ -f "$A64" ]; then
   fi
 fi
 
+# The freestanding artifact must survive a real TLS handshake.
+#
+# This is the gate that was missing when the x86_64 binary died in production:
+# every TLS case above runs the *harness*, which links glibc and therefore has
+# a mapped TLS block, and the freestanding binary itself was only ever driven
+# against the plaintext http sink. Two separate faults lived in that blind
+# spot -- a stack canary reading %fs:0x28 with no FS base installed, and gcc
+# 16's miscompile of BearSSL's AES-NI key schedule -- and both are reachable
+# only from the handshake, so nothing in the suite could see either.
+#
+# So: run the real deployable, with its real compiled-in trust anchors, at the
+# real public endpoint, and require that a cycle comes back with an HTTP status
+# at all. The 4xx from bogus credentials is the expected answer and is fine --
+# what is being asserted is that the process got far enough to receive one.
+# No credentials are needed or used; the handshake is the subject.
+freestanding_tls() { # freestanding_tls <bin>
+  local bin="$1" out rc
+  out=$(cd /tmp && INTERVAL=2 \
+      GW_URL="https://prometheus-us-central1.grafana.net/api/prom/push" \
+      GW_USER="tls-probe" GW_PASS="tls-probe" \
+      timeout 20 "$bin" 2>&1)
+  rc=$?
+  if [ "$rc" -ge 128 ]; then
+    echo "FAIL: freestanding TLS ($bin): killed by signal $((rc - 128))"
+    echo "$out" | tail -3; fail=1; return
+  fi
+  if ! echo "$out" | grep -q 'cycle .*http='; then
+    echo "FAIL: freestanding TLS ($bin): no cycle reached an HTTP response"
+    echo "$out" | tail -3; fail=1; return
+  fi
+  echo "PASS: freestanding TLS ($bin): $(echo "$out" | grep -o 'http=[0-9]*' | head -1)"
+}
+if command -v timeout >/dev/null; then
+  freestanding_tls "$BIN"
+else
+  echo "SKIP: freestanding TLS: timeout(1) not found"
+fi
+
 bash "$DIR/tests/fake_root.sh" "$ROOT"
 
 "$BIN" --path.rootfs="$ROOT" --metrics-once >"$DIR/tests/.M.txt" 2>"$DIR/tests/.metrics.log"
@@ -289,6 +327,33 @@ else
   echo "SKIP: build/tests/pico_exporter-capped missing (run make test)"
 fi
 
+# A collection that does not fit the arena must die loudly and name the knob,
+# not truncate the push and not fall back to a heap. build/tests/pico_exporter-tiny
+# is the same code built with ARENA_CAP=4096, one page, because the real 1 MiB
+# cannot be exhausted by anything a test host has.
+TINYBIN="$DIR/build/tests/pico_exporter-tiny"
+if [ -x "$TINYBIN" ]; then
+  "$TINYBIN" --path.rootfs="$DIR/tests/.fake" --metrics-once \
+      >"$DIR/tests/.tiny.out" 2>"$DIR/tests/.tiny.log"
+  TINYRC=$?
+  TINYLOG="$(cat "$DIR/tests/.tiny.log")"
+  # Non-zero, nothing on stdout (a truncated exposition would be read as a
+  # smaller host), and a message that says what was needed and which knob to
+  # turn -- the operator has to be able to tell "raise the cap" from "this
+  # host is broken".
+  if [ "$TINYRC" = "1" ] && [ ! -s "$DIR/tests/.tiny.out" ] &&
+     grep -q 'arena exhausted: need .* of .* B in use' "$DIR/tests/.tiny.log" &&
+     grep -q 'raise ARENA_CAP' "$DIR/tests/.tiny.log"; then
+    echo "PASS: exhausted arena is fatal, no partial output (rc=1; $TINYLOG)"
+  else
+    echo "FAIL: exhausted arena not fatal (rc=$TINYRC want 1, stdout $(wc -c <"$DIR/tests/.tiny.out") B want 0, log: $TINYLOG)"
+    fail=1
+  fi
+  rm -f "$DIR/tests/.tiny.out" "$DIR/tests/.tiny.log"
+else
+  echo "SKIP: build/tests/pico_exporter-tiny missing (run make test)"
+fi
+
 # --- hwmon/thermal ---
 check "hwmon temp"                'node_hwmon_temp_celsius\{chip="cpu_thermal",label="cpu_thermal"\} 9\.15'
 check "hwmon temp label"          'node_hwmon_temp_celsius\{chip="cpu_thermal",label="Package id 0"\} 42'
@@ -496,6 +561,12 @@ if command -v python3 >/dev/null 2>&1; then
     [ "$r" -lt "$RSS_MIN" ] && RSS_MIN="$r"
     sleep 0.3
   done
+  # The steady state has no allocator to leak into: brk would show up as
+  # [heap] and mmap'd chunks as an anonymous mapping of their own. This gate is
+  # cheap rather than sharp -- the arena's mmap is 1 MiB and madvise'd away
+  # between cycles, so a fallback allocator using its own mmap would slip past
+  # it -- but it still catches a brk-backed malloc, and the arena's presence
+  # and size are what the RSS number above proves.
   HEAPS="$(grep -c '\[heap\]' /proc/$PUSHD/maps 2>/dev/null)"
   HEAPS="${HEAPS:-0}"
   sleep 1
@@ -522,7 +593,7 @@ if command -v python3 >/dev/null 2>&1; then
     if [ "${HEAPS:-0}" -eq 0 ]; then
       echo "PASS: no [heap] mapping"
     else
-      echo "FAIL: [heap] mapping present (malloc ran in a push mode steady state)"
+      echo "FAIL: [heap] mapping present (a brk-backed allocation ran in a push mode steady state)"
       fail=1
     fi
     # Two INTERVAL=2 cycles fit in the ~4.4 s window; 16 per cycle measured

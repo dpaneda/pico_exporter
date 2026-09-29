@@ -13,6 +13,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "freestand.h"
 
 #if defined(__x86_64__)
 __asm__(".section .init.start,\"ax\"\n"
@@ -62,8 +63,16 @@ FS_KEEP
 unsigned long __stack_chk_guard;
 char **environ;
 
+/* The block the x86_64 TLS guard reads its canary from (%fs:0x28). 64 bytes is
+   the shape of a TCB; it lives in .bss, which shares the one dirty data page
+   idle_sleep keeps, so pointing FS at it costs nothing at rest. The canary
+   value itself is the same AT_RANDOM secret that seeds __stack_chk_guard, so
+   both guard kinds share one unpredictable value. */
+static unsigned char fs_block[64] __attribute__((aligned(64)));
+
 int main(int argc, char **argv);
 void *memcpy(void *dst, const void *src, size_t n);
+void *memset(void *dst, int c, size_t n);
 
 /* _Noreturn so the noreturn callers (__stack_chk_fail, p_main) do not warn
    "noreturn function does return" when GCC cannot prove the raw-exit path. */
@@ -88,9 +97,8 @@ __attribute__((noreturn)) void exit(int code) { p_exit_now(code); }
 __attribute__((noreturn)) void abort(void) { p_exit_now(134); }
 
 /* Killing via exit_group would leave a half-open keep-alive socket to TIME
-   WAIT behind a test run; almost every user of exit here is `free()+
-   return -1`-adjacent, so a plain message + exit group is the whole contract
-   a program without stdio can offer. */
+   WAIT behind a test run, so the one caller that cares (the arena refusal)
+   prints its own message first and then exits the whole group. */
 FS_KEEP
 __attribute__((noreturn)) void __stack_chk_fail(void) {
     static const char msg[] = "stack smashing detected\n";
@@ -140,11 +148,23 @@ PMAIN_NOSP __attribute__((noreturn, used, externally_visible)) void p_main(long 
     char **e = envp;
     while (*e) e++;
     const unsigned long *aux = (const unsigned long *)(e + 1);
+    unsigned long seed = 0;
     for (; aux[0]; aux += 2) {
         if (aux[0] == 25 && aux[1]) {
             memcpy(&__stack_chk_guard, (const void *)(uintptr_t)aux[1],
                    sizeof __stack_chk_guard);
+            seed = __stack_chk_guard;
         }
+    }
+    /* BearSSL is compiled at default flags, so its canaries read %fs:0x28,
+       which on this link is unmapped. Point FS at the block first, then fill
+       the slot -- in that order, so no canary load can ever see a zero. A
+       zero canary is what the x86_64 guard treats as "nothing to check"; if
+       auxv carried no AT_RANDOM the secret falls back to a fixed nonzero
+       value, which is weaker but still a real comparison. */
+    if (fs_set_tls_block(fs_block) == 0) {
+        memcpy(fs_block + 40, &seed, sizeof seed);
+        if (seed == 0) memset(fs_block + 40, 0xa5, sizeof seed);
     }
 
     exit(main((int)argc, argv));

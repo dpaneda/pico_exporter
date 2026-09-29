@@ -20,7 +20,6 @@
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stdint.h>
-#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -104,26 +103,19 @@ static void make_path(char *path, size_t sz, const char *rootfs, const char *rel
    each of them -- and stack pages, unlike the arena, are never returned once
    touched.
 
-   In push mode the 4 kB primary is carved from the cycle arena, which hands
-   the pages back at the end of every cycle: as 4 kB of .bss it was resident
-   for the life of the process, 3% of the whole resting footprint, to serve a
-   buffer that is only live while a file is being parsed. The one-shot modes
-   have no arena and malloc it once. Either way a file that does not fit grows
-   the buffer by doubling rather than being truncated, the way a constant
-   8 kB once truncated /proc/net/udp on a host with many sockets. Once the
-   heap is in play it stays -- the freestanding malloc keeps whole pages
-   anyway. */
-static struct arena *g_rar;      /* cycle arena, NULL in the one-shot modes */
+   It is carved from the cycle arena, which hands the pages back at the end of
+   every cycle: as 4 kB of .bss it was resident for the life of the process,
+   3% of the whole resting footprint, to serve a buffer that is only live while
+   a file is being parsed. A file that does not fit grows the buffer by
+   doubling rather than being truncated, the way a constant 8 kB once truncated
+   /proc/net/udp on a host with many sockets. */
+static struct arena *g_rar;    /* the sink's arena, set by metrics_init */
 static char   *g_rbuf;
 static size_t  g_rcap;
 static size_t  g_rhint = 4096;   /* survives the reset: see rbuf_cycle_end */
-static char   *g_rheap;          /* sticky malloc fallback, process-lifetime */
-
-void collectors_set_arena(struct arena *ar) { g_rar = ar; }
 
 /* Invalidates the arena-backed buffer; arena_reset has taken its pages back. */
 static void rbuf_cycle_end(void) {
-    if (g_rheap) return;
     /* Carry the size forward. A host with a /proc table above 4 kB would
        otherwise re-grow every cycle and strand the undersized block in the
        arena, the same doubling waste the sample array used to pay. */
@@ -132,29 +124,13 @@ static void rbuf_cycle_end(void) {
     g_rcap = 0;
 }
 
-static int rbuf_reserve(size_t need) {
-    if (g_rbuf && need <= g_rcap) return 0;
+static void rbuf_reserve(size_t need) {
+    if (g_rbuf && need <= g_rcap) return;
     size_t nc = g_rcap ? g_rcap : g_rhint;
     while (nc < need) nc *= 2;
-    if (!g_rheap && g_rar) {
-        char *np = g_rbuf ? arena_realloc(g_rar, g_rbuf, g_rcap, nc)
-                          : arena_alloc(g_rar, nc);
-        if (np) {
-            g_rbuf = np;
-            g_rcap = nc;
-            return 0;
-        }
-    }
-    /* No arena, or it is exhausted. realloc(NULL) would hand back a fresh
-       block and drop what has already been read, so the first move off the
-       arena copies by hand. */
-    char *np = g_rheap ? realloc(g_rheap, nc) : malloc(nc);
-    if (!np) return -1;
-    if (!g_rheap && g_rbuf) memcpy(np, g_rbuf, g_rcap);
-    g_rheap = np;
-    g_rbuf = np;
+    g_rbuf = g_rbuf ? arena_realloc(g_rar, g_rbuf, g_rcap, nc)
+                    : arena_alloc(g_rar, nc);
     g_rcap = nc;
-    return 0;
 }
 
 /* ---------- small/file helpers ---------- */
@@ -178,16 +154,13 @@ static long read_abs(const char *path, char *buf, size_t cap) {
     return (long)n;
 }
 
-/* readProc() equivalent: whole file, stripped, or empty on error. Buffer is
-   the caller's; returns the stripped length. */
 /* Reads a whole /proc or /sys file into the shared buffer. Returns it (empty
-   when the file is absent), or NULL only if the buffer could not be grown.
-   Reading to EOF instead of a fixed cap is what keeps the metrics correct on a
-   host whose tables are larger than this one's. */
+   when the file is absent). Reading to EOF instead of a fixed cap is what keeps
+   the metrics correct on a host whose tables are larger than this one's. */
 static const char *read_proc(const char *rootfs, const char *rel) {
     char path[512];
     make_path(path, sizeof path, rootfs, rel);
-    if (rbuf_reserve(4096) != 0) return NULL;
+    rbuf_reserve(4096);
     g_rbuf[0] = 0;
     int fd = open(path, O_RDONLY);
     if (fd < 0) return g_rbuf;
@@ -195,7 +168,7 @@ static const char *read_proc(const char *rootfs, const char *rel) {
     for (;;) {
         size_t room = g_rcap - n - 1;
         if (room == 0) {
-            if (rbuf_reserve(g_rcap * 2) != 0) break;
+            rbuf_reserve(g_rcap * 2);
             room = g_rcap - n - 1;
         }
         ssize_t r = read(fd, g_rbuf + n, room);
@@ -271,11 +244,16 @@ static unsigned long long parse_hex(const char *s) {
 
 /* ---------- metrics sink ---------- */
 
+/* The text buffer is the only long-lived allocation of a --metrics-once run
+   besides the read buffer, so it doubles from the arena: in place while it is
+   still the last block, a fresh block plus a copy when a collector's scratch
+   has been carved behind it. */
 static void txt_grow(struct metrics *m, size_t extra) {
     if (m->tlen + extra + 1 <= m->tcap) return;
     size_t ncap = m->tcap ? m->tcap : 4096;
     while (ncap < m->tlen + extra + 1) ncap *= 2;
-    m->txt = realloc(m->txt, ncap);
+    m->txt = m->txt ? arena_realloc(m->ar, m->txt, m->tcap, ncap)
+                    : arena_alloc(m->ar, ncap);
     m->tcap = ncap;
 }
 
@@ -299,102 +277,23 @@ static void samp_grow(struct metrics *m) {
     if (ncap == 0) ncap = g_scap_hint ? g_scap_hint + g_scap_hint / 8 + 16 : 256;
     while (ncap <= m->n) ncap *= 2;
     if (ncap > COLLECT_MAX_SAMPLES) ncap = COLLECT_MAX_SAMPLES;
-    if (m->ar) {
-        /* Arena path (hot). A heap body from an earlier arena exhaustion is
-           not arena_realloc's to grow, so that case copies by hand. Falls back
-           to malloc when the arena is exhausted (pathologically large
-           collection only). */
-        bool heap = false;
-        struct msample *na;
-        if (m->samples && !m->heap_samples) {
-            /* arena_realloc extends in place when it can and copies when it
-               cannot, so this branch never copies by hand. */
-            na = arena_realloc(m->ar, m->samples, m->scap * sizeof *na,
-                               ncap * sizeof *na);
-        } else {
-            na = arena_alloc(m->ar, ncap * sizeof *na);
-            if (na && m->samples)
-                memcpy(na, m->samples, m->n * sizeof *m->samples);
-        }
-        if (!na) {
-            na = malloc(ncap * sizeof *na);
-            if (!na) return;            /* scap unchanged; caller must recheck */
-            heap = true;
-            char msg[96];
-            char *o = msg;
-            fmt_str_append(&o, "WARN samp_grow: arena exhausted, malloc ");
-            fmt_u64_append(&o, ncap * sizeof *na);
-            fmt_str_append(&o, "\n");
-            write(2, msg, (size_t)(o - msg));
-            if (m->samples) memcpy(na, m->samples, m->n * sizeof *m->samples);
-        }
-        if (m->heap_samples) free(m->samples);
-        m->samples = na;
-        m->heap_samples = heap;
-        m->scap = ncap;
-        return;
-    }
-    struct msample *na = realloc(m->samples, ncap * sizeof *na);
-    if (!na) return;                    /* scap unchanged; caller must recheck */
-    m->samples = na;
-    m->heap_samples = true;
+    /* arena_realloc extends in place while the array is still the arena's last
+       block and copies when it is not, so this never moves a block by hand. */
+    m->samples = m->samples
+        ? arena_realloc(m->ar, m->samples, m->scap * sizeof *m->samples,
+                        ncap * sizeof *m->samples)
+        : arena_alloc(m->ar, ncap * sizeof *m->samples);
     m->scap = ncap;
 }
 
-/* Store a <=len string copy; returns a pointer valid until metrics_free.
-   Arena mode: carved from the cycle arena (evicted with it). Otherwise a
-   strdup tracked in sfree[] so metrics_free can release it. */
-/* Records a heap pointer so metrics_free releases it on both paths. */
-static int track_heap(struct metrics *m, void *p) {
-    if (m->nsfree == m->capsf) {
-        size_t nc = m->capsf ? m->capsf * 2 : 16;
-        char **nb = realloc(m->sfree, nc * sizeof *nb);
-        if (!nb) return -1;
-        m->sfree = nb;
-        m->capsf = nc;
-    }
-    m->sfree[m->nsfree++] = p;
-    return 0;
-}
-
-/* Per-cycle block allocator: the arena in push mode, tracked malloc in the
-   one-shot text modes (m->ar == NULL) and when the arena is exhausted. Lets a
-   collector size its scratch from the input it just read instead of a fixed
-   bound that silently drops entries on a bigger host -- and the arena returns
-   the pages at cycle end, unlike .bss. */
-static void *m_alloc(struct metrics *m, size_t n) {
-    if (n == 0) return NULL;
-    if (m->ar) {
-        void *p = arena_alloc(m->ar, n);
-        if (p) return p;
-    }
-    void *p = malloc(n);
-    if (!p) return NULL;
-    if (track_heap(m, p) != 0) {
-        free(p);
-        return NULL;
-    }
-    return p;
-}
-
+/* Store a <=len string copy; returns a pointer valid until metrics_free, i.e.
+   carved from the cycle arena and evicted with it. Names and label values are
+   stored one by one, which is what keeps the arena's cost per series at a
+   couple of hundred bytes instead of a fixed-size inline label array. */
 static const char *nm_store(struct metrics *m, const char *s, size_t n) {
-    char *p;
-    if (m->ar) {
-        p = arena_alloc(m->ar, n + 1);
-        if (p) {
-            memcpy(p, s, n);
-            p[n] = 0;
-            return p;
-        }
-    }
-    p = malloc(n + 1);
-    if (!p) return NULL;
+    char *p = arena_alloc(m->ar, n + 1);
     memcpy(p, s, n);
     p[n] = 0;
-    if (track_heap(m, p) != 0) {
-        free(p);
-        return NULL;
-    }
     return p;
 }
 
@@ -431,7 +330,6 @@ static int parse_labels(struct metrics *m, const char *labels,
         size_t vl = (size_t)(vend - v);
         const char *ks = nm_store(m, k, kl);
         const char *vs = nm_store(m, v, vl);
-        if (!ks || !vs) break;
         out[n].k = ks;
         out[n].v = vs;
         n++;
@@ -489,21 +387,15 @@ void metrics_line(struct metrics *m, const char *name, const char *labels,
             return;
         }
         samp_grow(m);
-        if (m->n >= m->scap) {          /* grow failed */
-            m->ndropped++;
-            return;
-        }
         struct msample *s = &m->samples[m->n];
         s->name = nm_store(m, name, strlen(name));
-        if (!s->name) return;
         struct mkv tmp[COLLECT_MAX_LABELS];
         int nl = parse_labels(m, labels, tmp, COLLECT_MAX_LABELS);
         if (nl == COLLECT_MAX_LABELS) m->nlabels_capped++;
         s->labels = NULL;
         s->nlabels = 0;
         if (nl > 0) {
-            struct mkv *lv = m_alloc(m, (size_t)nl * sizeof *lv);
-            if (!lv) return;
+            struct mkv *lv = arena_alloc(m->ar, (size_t)nl * sizeof *lv);
             memcpy(lv, tmp, (size_t)nl * sizeof *lv);
             s->labels = lv;
             s->nlabels = nl;
@@ -517,10 +409,8 @@ void metrics_add(struct metrics *m, const char *name, double value) {
     if (m->text_mode) return;
     if (m->n >= COLLECT_MAX_SAMPLES) return;
     samp_grow(m);
-    if (m->n >= m->scap) return;        /* grow failed */
     struct msample *s = &m->samples[m->n];
     s->name = nm_store(m, name, strlen(name));
-    if (!s->name) return;
     s->labels = NULL;
     s->nlabels = 0;
     s->value = value;
@@ -613,7 +503,6 @@ static void collect_uname(struct metrics *m) {
 static void collect_load(struct metrics *m) {
     char *toks[8];
     char *buf = (char *)read_proc(m->rootfs, "proc/loadavg");
-    if (!buf) return;
     int n = split_ws(buf, toks, 8);
     if (n >= 3) {
         metrics_line(m, "node_load1", "", mv_str(toks[0]));
@@ -729,8 +618,7 @@ static void collect_disk_bytes(struct metrics *m) {
     /* read+written bytes per device, emitted grouped by metric. */
     struct devv { char dev[32]; long long r, w; };
     size_t dmax = count_lines(p);
-    struct devv *devs = m_alloc(m, dmax * sizeof *devs);
-    if (!devs) return;
+    struct devv *devs = arena_alloc(m->ar, dmax * sizeof *devs);
     int nd = 0;
     char *toks[24];
     while (*p && (size_t)nd < dmax) {
@@ -777,7 +665,6 @@ static void collect_disk_bytes(struct metrics *m) {
 static void collect_filefd(struct metrics *m) {
     char *toks[8];
     char *buf = (char *)read_proc(m->rootfs, "proc/sys/fs/file-nr");
-    if (!buf) return;
     int n = split_ws(buf, toks, 8);
     if (n >= 3) {
         metrics_line(m, "node_filefd_allocated", "", mv_str(toks[0]));
@@ -798,9 +685,8 @@ static void collect_filesystem(struct metrics *m) {
     struct fsrow { char l[256]; unsigned long long v[FS_NVAL]; };
     struct seenm { char mp[128]; };
     size_t fsmax = count_lines(p);
-    struct fsrow *fsr = m_alloc(m, fsmax * sizeof *fsr);
-    struct seenm *seen = m_alloc(m, fsmax * sizeof *seen);
-    if (!fsr || !seen) return;
+    struct fsrow *fsr = arena_alloc(m->ar, fsmax * sizeof *fsr);
+    struct seenm *seen = arena_alloc(m->ar, fsmax * sizeof *seen);
     int nfs = 0;
     int nseen = 0;
     char *toks[16];
@@ -919,8 +805,7 @@ static void collect_network(struct metrics *m) {
     struct pdir d;
     if (pdir_open(&d, base) != 0) return;
     size_t if_cap = 8;
-    struct nif *ifs = m_alloc(m, if_cap * sizeof *ifs);
-    if (!ifs) { pdir_close(&d); return; }
+    struct nif *ifs = arena_alloc(m->ar, if_cap * sizeof *ifs);
     int nifs = 0;
     const char *e;
     while ((e = pdir_next(&d)) != NULL) {
@@ -929,8 +814,7 @@ static void collect_network(struct metrics *m) {
             continue;
         if ((size_t)nifs >= if_cap) {
             size_t nif_cap = if_cap * 2;
-            struct nif *ifs_new = m_alloc(m, nif_cap * sizeof *ifs_new);
-            if (!ifs_new) break;
+            struct nif *ifs_new = arena_alloc(m->ar, nif_cap * sizeof *ifs_new);
             memcpy(ifs_new, ifs, (size_t)nifs * sizeof *ifs);
             ifs = ifs_new;
             if_cap = nif_cap;
@@ -1147,10 +1031,10 @@ static void collect_diskstats(struct metrics *m) {
        This was part[256]/parent[256], 8,192 B of the frame. */
     struct paren { char part[32], parent[32]; };
     size_t pcap = 16;
-    struct paren *par = m_alloc(m, pcap * sizeof *par);
+    struct paren *par = arena_alloc(m->ar, pcap * sizeof *par);
     int np = 0;
     struct pdir bd;
-    if (par && pdir_open(&bd, sbase) == 0) {
+    if (pdir_open(&bd, sbase) == 0) {
         const char *be;
         while ((be = pdir_next(&bd)) != NULL) {
             if (skip_blockdev(be)) continue;
@@ -1179,8 +1063,7 @@ static void collect_diskstats(struct metrics *m) {
                     close(pfd);
                     if ((size_t)np >= pcap) {
                         size_t npcap = pcap * 2;
-                        struct paren *npar = m_alloc(m, npcap * sizeof *npar);
-                        if (!npar) break;
+                        struct paren *npar = arena_alloc(m->ar, npcap * sizeof *npar);
                         memcpy(npar, par, (size_t)np * sizeof *par);
                         par = npar;
                         pcap = npcap;
@@ -1395,8 +1278,7 @@ static void collect_udp_queues(struct metrics *m) {
            dropped sockets past the 64th and, before the bound was added, ran
            off the end of the array. */
         size_t amax = count_lines(body);
-        char **arr = m_alloc(m, amax * sizeof *arr);
-        if (!arr) continue;
+        char **arr = arena_alloc(m->ar, amax * sizeof *arr);
         int n = 0;
         char *line = body;
         while (*line && (size_t)n < amax) {
@@ -1452,8 +1334,7 @@ static void collect_hwmon(struct metrics *m) {
                second walk of the chip directory to size it. */
             struct tval { char num[16]; double c; };
             size_t tcap = 16;
-            struct tval *temps = m_alloc(m, tcap * sizeof *temps);
-            if (!temps) continue;
+            struct tval *temps = arena_alloc(m->ar, tcap * sizeof *temps);
             int nt = 0;
             struct pdir cd;
             if (pdir_open(&cd, cdir) != 0) continue;
@@ -1500,8 +1381,7 @@ static void collect_hwmon(struct metrics *m) {
                     if (read_abs(fname, vb, sizeof vb) <= 0) continue;
                     if ((size_t)nt >= tcap) {
                         size_t ntcap = tcap * 2;
-                        struct tval *ntemps = m_alloc(m, ntcap * sizeof *ntemps);
-                        if (!ntemps) break;
+                        struct tval *ntemps = arena_alloc(m->ar, ntcap * sizeof *ntemps);
                         memcpy(ntemps, temps, (size_t)nt * sizeof *temps);
                         temps = ntemps;
                         tcap = ntcap;
@@ -1604,8 +1484,7 @@ static void collect_systemd(struct metrics *m) {
     int fd = popen_sh("systemctl list-units --all --type=service -o json-pretty");
     if (fd < 0) return;
     size_t cap = 16384, len = 0;
-    char *buf = (char *)m_alloc(m, cap);
-    if (!buf) { pclose_sh(fd); return; }
+    char *buf = (char *)arena_alloc(m->ar, cap);
     for (;;) {
         if (len + 1 >= cap) {
             /* 4 MB of systemctl output would mean something is deeply wrong
@@ -1613,8 +1492,7 @@ static void collect_systemd(struct metrics *m) {
                forever. */
             if (cap >= 4u << 20) { len = 0; break; }
             size_t ncap = cap * 2;
-            char *nb = (char *)m_alloc(m, ncap);
-            if (!nb) { break; }
+            char *nb = (char *)arena_alloc(m->ar, ncap);
             memcpy(nb, buf, len);
             buf = nb;
             cap = ncap;
@@ -1767,7 +1645,6 @@ static void collect_textfile(struct metrics *m) {
         /* read_proc hands back the one shared buffer, so a file has to be
            parsed to the end before the next one is read. */
         char *buf = (char *)read_proc(g_textfile_dir, e);
-        if (!buf) { failed++; continue; }
 
         for (char *line = buf; *line; ) {
             char *nl = strchr(line, '\n');
@@ -1825,8 +1702,16 @@ void collect_all(struct metrics *m) {
                     (double)m->ndropped);
 }
 
-void metrics_init(struct metrics *m, bool text_mode, const char *rootfs) {
+/* `ar` is the mode's arena: the push loop's, reset every cycle, or a local one
+   for a single one-shot collection. It is a parameter rather than a separate
+   set_arena() call because every mode has one and no mode can do without it,
+   and because the shared read buffer has to come out of the same place -- it
+   is module state (g_rar), so it is wired up here. */
+void metrics_init(struct metrics *m, struct arena *ar, bool text_mode,
+                  const char *rootfs) {
     memset(m, 0, sizeof *m);
+    m->ar = ar;
+    g_rar = ar;
     m->text_mode = text_mode;
     if (!rootfs || rootfs[0] == 0 || strcmp(rootfs, "/") == 0)
         m->rootfs = "";
@@ -1838,28 +1723,14 @@ void metrics_init(struct metrics *m, bool text_mode, const char *rootfs) {
 
 void metrics_free(struct metrics *m) {
     if (m->n) g_scap_hint = m->n;
-    /* Heap-owned memory first: in arena mode these are the arena-exhaustion
-       fallbacks, which arena_reset does not cover. Skipping them leaked a
-       cycle's worth of strings on every overflowing cycle of the push loop. */
-    for (size_t i = 0; i < m->nsfree; i++) free(m->sfree[i]);
-    free(m->sfree);
-    m->sfree = NULL;
-    m->nsfree = 0;
-    m->capsf = 0;
-    if (m->heap_samples) free(m->samples);
-    m->heap_samples = false;
+    /* Everything a collection carved came out of the arena, so releasing it is
+       one rewind: MADV_DONTNEED hands the cycle's pages back so only the
+       resting baseline stays resident (see AGENTS.md), not the sample and
+       label memory the collection just touched. */
+    arena_reset(m->ar);
+    rbuf_cycle_end();
     m->samples = NULL;
     m->scap = 0;
-
-    if (m->ar) {
-        /* Rewind + MADV_DONTNEED: evict the cycle's pages during the sleep so
-           only the resting baseline stays resident (see AGENTS.md), not the
-           sample and label memory the collection just touched. */
-        arena_reset(m->ar);
-        rbuf_cycle_end();
-        return;
-    }
-    free(m->txt);
     m->txt = NULL;
     m->tlen = 0;
     m->tcap = 0;
@@ -1869,13 +1740,22 @@ void metrics_free(struct metrics *m) {
    contains substr. */
 void metrics_dump(struct metrics *m, const char *substr) {
     struct msample *s = m->samples;
+    /* One reused line buffer off the arena, grown to the widest match. The
+       collection is over, so nothing else allocates and the buffer stays the
+       arena's last block: every growth after the first extends in place. */
+    char *buf = NULL;
+    size_t cap = 0;
     for (size_t i = 0; i < m->n; i++) {
         if (strstr(s[i].name, substr) == NULL) continue;
         size_t need = strlen(s[i].name) + 1; /* { */
         for (int j = 0; j < s[i].nlabels; j++)
             need += strlen(s[i].labels[j].k) + 1 + strlen(s[i].labels[j].v) + 1;
-        size_t cap = need + 192;
-        char *buf = malloc(cap);
+        if (need + 192 > cap) {
+            size_t ncap = need + 192;
+            buf = buf ? arena_realloc(m->ar, buf, cap, ncap)
+                      : arena_alloc(m->ar, ncap);
+            cap = ncap;
+        }
         char *o = buf;
         *o++ = 'D'; *o++ = 'U'; *o++ = 'M'; *o++ = 'P';
         *o++ = ' ';
@@ -1901,6 +1781,5 @@ void metrics_dump(struct metrics *m, const char *substr) {
             if (w <= 0) break;
             off += (size_t)w;
         }
-        free(buf);
     }
 }

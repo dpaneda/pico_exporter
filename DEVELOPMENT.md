@@ -65,8 +65,9 @@ Per-file detail is in [AGENTS.md](AGENTS.md).
 
 ```
 src/        entry, collectors, OTLP encoder, push, DNS, BearSSL glue, arena
-            + the freestanding runtime: start.c (crt/environ), freestand.c
-            (syscall wrappers, mem/str, popen_sh), alloc.c (heap), pico.ld
+            (the only allocator) + the freestanding runtime: start.c
+            (crt/environ), freestand.c (syscall wrappers, mem/str, popen_sh),
+            pico.ld
 srv/        minimal socket/in.h/utsname.h stubs shadowing the host headers
 vendor/     embedded trust anchors
 tests/      integration harness + fake-rootfs fixtures (generated, no golden files)

@@ -12,20 +12,17 @@ struct otlp_kv {
     const char *v;
 };
 
-/* Encoder buffer. When `ar` is set the data lives on the cycle arena (fresh
-   region per otlp_encode call, reclaimed by arena_reset at cycle end);
-   otherwise a caller-owned heap buffer grown with realloc. */
+/* Encoder buffer. `data` lives on the cycle arena (a fresh region per growth,
+   reclaimed by arena_reset at cycle end), so `ar` is required, not optional. */
 struct arena;
 struct otlp_buf {
     char *data;
     size_t len;
     size_t cap;
-    int   dry;   /* internal: counting pass, no writes */
-    int   owned; /* internal: `data` is malloc/realloc-owned, must be freed */
+    int   dry;        /* internal: counting pass, no writes */
     struct arena *ar;
 };
 
-int  otlp_buf_reserve(struct otlp_buf *b, size_t extra);   /* 0 ok */
 void otlp_buf_reset(struct otlp_buf *b);
 
 /* Encodes samples[first..first+count) at ts_ns (real ns) with one resource

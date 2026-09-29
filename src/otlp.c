@@ -34,7 +34,7 @@
 #define WIRE_FIXED64 1
 #define WIRE_LEN 2
 
-static int  buf_ensure(struct otlp_buf *b, size_t need);   /* 0 ok */
+static void buf_ensure(struct otlp_buf *b, size_t need);
 
 static void put(struct otlp_buf *b, unsigned char c) {
     if (!b->dry) b->data[b->len] = (char)c;
@@ -164,60 +164,18 @@ static void emit_all(struct otlp_buf *b, const struct msample *samples,
     frame_close(b, rml);
 }
 
-int otlp_buf_reserve(struct otlp_buf *b, size_t extra) {
-    if (b->len + extra <= b->cap) return 0;
-    size_t need = b->len + extra;
-    if (b->cap == 0 && need < 4096) need = 4096;
-    return buf_ensure(b, need);
-}
-
-static int buf_ensure(struct otlp_buf *b, size_t need) {
-    if (need <= b->cap) return 0;
-    if (b->ar) {
-        /* Hot path: the region comes from the cycle arena. Encoding runs after
-           collection, so the buffer is normally still the arena's last block
-           and the next cycle just extends it in place; otherwise a fresh
-           region supersedes it (no free; reclaimed at cycle end). No copy
-           either way -- otlp_encode sizes with a dry pass, then rewrites from
-           zero. Falls back to malloc only if the arena is exhausted (never in
-           production). */
-        int heap = 0;
-        char *na = (b->data && !b->owned)
-                     ? arena_extend(b->ar, b->data, b->cap, need) : NULL;
-        if (!na) na = arena_alloc(b->ar, need);
-        if (!na) {
-            na = malloc(need);
-            if (!na) return 1;
-            heap = 1;
-            {
-                char msg[96];
-                char *o = msg;
-                fmt_str_append(&o, "WARN otlp: arena exhausted, malloc ");
-                fmt_u64_append(&o, need);
-                fmt_str_append(&o, "\n");
-                size_t len = (size_t)(o - msg);
-                size_t off = 0;
-                while (off < len) {
-                    ssize_t w = write(2, msg + off, len - off);
-                    if (w <= 0) break;
-                    off += (size_t)w;
-                }
-            }
-        }
-        /* A heap region from an earlier exhausted cycle is not reclaimed by
-           arena_reset, so this is the only chance to release it. */
-        if (b->owned) free(b->data);
-        b->data = na;
-        b->owned = heap;
-        b->cap = need;
-        return 0;
-    }
-    char *nd = realloc(b->data, need);
-    if (!nd) return 1;
-    b->data = nd;
-    b->owned = 1;
+/* Single allocation path: the encode buffer lives on the cycle arena and is
+   grown there. Encoding runs after collection, so the buffer is normally still
+   the arena's last block and the next cycle just extends it in place;
+   otherwise a fresh region supersedes it (no free; reclaimed at cycle end).
+   No copy either way -- otlp_encode sizes with a dry pass, then rewrites from
+   zero. An arena that cannot serve the frame kills the process rather than
+   growing on the heap: see arena.c. */
+static void buf_ensure(struct otlp_buf *b, size_t need) {
+    if (need <= b->cap) return;
+    b->data = b->data ? arena_extend(b->ar, b->data, b->cap, need)
+                       : arena_alloc(b->ar, need);
     b->cap = need;
-    return 0;
 }
 
 size_t otlp_encode(struct otlp_buf *out, const struct msample *samples,
@@ -231,22 +189,19 @@ size_t otlp_encode(struct otlp_buf *out, const struct msample *samples,
     size_t need = out->len;
     out->dry = saved_dry;
 
-    if (buf_ensure(out, need) != 0) { out->len = 0; return 0; }
+    buf_ensure(out, need);
     out->len = 0;
     emit_all(out, samples, n, res, res_n, ts_ns, first, count);
     return out->len;
 }
 
-/* Drops the buffer as well as its contents. Mandatory once per cycle in arena
-   mode: arena_reset hands the region back, so keeping `data`/`cap` across the
+/* Drops the buffer as well as its contents. Mandatory once per cycle:
+   arena_reset hands the region back, so keeping `data`/`cap` across the
    boundary leaves a stale pointer that buf_ensure will happily write through
    -- straight over the next cycle's live samples as soon as a collection
    reaches that far up the arena. */
 void otlp_buf_reset(struct otlp_buf *b) {
     b->len = 0;
-    if (!b->ar) return;
-    if (b->owned) free(b->data);
     b->data = NULL;
     b->cap = 0;
-    b->owned = 0;
 }
