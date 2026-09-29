@@ -78,9 +78,6 @@ build_bearssl_lib() {
   printf '%s' "$BEARSSL_CFLAGS_NO128" > "$out.cflags"
 }
 
-# Per-target extra flags for build_bearssl_lib_lto, set by the callers below.
-BEARSSL_EXTRA=""
-
 # x86_64 only, and not a stylistic choice: gcc 16 miscompiles BearSSL's
 # AES-NI key schedule. br_aes_x86ni_keysched_enc ends up with a movaps to a
 # 16-byte stack slot the prologue never aligned, so the first TLS handshake
@@ -106,7 +103,7 @@ build_bearssl_lib_lto() {
   local out="$1"
   local cc="${2:-${AARCH64_CC:-aarch64-linux-gnu-gcc}}"
   local ar="${3:-${AARCH64_AR:-aarch64-linux-gnu-ar}}"
-  local extra="${4:-$BEARSSL_EXTRA}"
+  local extra="${4:-}"
   local flags="$BEARSSL_CFLAGS_NO128 -flto $extra"
   local work
   bearssl_lib_is_current "$out" "$flags" && return 0

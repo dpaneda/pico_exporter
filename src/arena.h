@@ -17,7 +17,7 @@ struct arena {
 
 int  arena_init(struct arena *a, size_t cap);   /* 0 ok, 1 ENOMEM-ish */
 void arena_reset(struct arena *a);              /* rewind + MADV_DONTNEED */
-void *arena_alloc(struct arena *a, size_t n);   /* never fails: dies instead */
+void *arena_alloc(struct arena *a, size_t n) __attribute__((returns_nonnull));
 
 /* Grows the block at `p` (allocated with size `oldn`) to `newn` without moving
    it, which only works while `p` is still the arena's last block. Returns `p`,
@@ -27,6 +27,7 @@ void *arena_extend(struct arena *a, void *p, size_t oldn, size_t newn);
 
 /* arena_extend, falling back to a fresh region plus a copy of the first `oldn`
    bytes. Never returns NULL. */
-void *arena_realloc(struct arena *a, void *p, size_t oldn, size_t newn);
+void *arena_realloc(struct arena *a, void *p, size_t oldn, size_t newn)
+    __attribute__((returns_nonnull));
 
 #endif
