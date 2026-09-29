@@ -44,13 +44,16 @@
 
 extern char **environ;   /* defined in src/start.c */
 
+/* arch_prctl / the FS base: only x86_64 needs it (see fs_set_tls_block), but
+   the number has to exist for the aarch64 table too, so both declare it. */
+#define FS_ARCH_SET_FS 0x1002
+
 #if defined(__aarch64__)
 #define FS_SYS_read          63
 #define FS_SYS_write         64
 #define FS_SYS_close         57
 #define FS_SYS_openat        56
 #define FS_SYS_mmap          222
-#define FS_SYS_munmap        215
 #define FS_SYS_madvise       233
 #define FS_SYS_clock_gettime 113
 #define FS_SYS_gettimeofday  169
@@ -68,7 +71,6 @@ extern char **environ;   /* defined in src/start.c */
 #define FS_SYS_close         3
 #define FS_SYS_openat        257
 #define FS_SYS_mmap          9
-#define FS_SYS_munmap        11
 #define FS_SYS_madvise       28
 #define FS_SYS_clock_gettime 228
 #define FS_SYS_gettimeofday  78
@@ -76,6 +78,7 @@ extern char **environ;   /* defined in src/start.c */
 #define FS_SYS_statfs        137
 #define FS_SYS_rt_sigprocmask 14
 #define FS_SYS_clone         56
+#define FS_SYS_arch_prctl    158
 #define FS_SYS_execve        59
 #define FS_SYS_wait4         61
 #define FS_SYS_pipe2         293
@@ -159,6 +162,33 @@ int fs_ignore_sigpipe(void) {
     return 0;
 }
 
+/* --- thread base (TLS) ----------------------------------------------------- */
+
+/* The x86_64 default stack-protector guard reads the canary from %fs:0x28. On
+   a -nostdlib link the kernel starts the process with no FS base at all, so
+   that load faults: every canary-protected function dies with SIGSEGV before
+   it can compare anything. Our own TUs are compiled with
+   -mstack-protector-guard=global and never touch %fs, but BearSSL is a
+   separate build (tools/bearssl_env.sh) compiled at default flags, and it
+   brings 101 of those loads with it. Rather than fight that -- the guard is a
+   per-TU codegen decision carried in each function's LTO target options, so
+   neither the link-time flag nor -fno-stack-protector can cover BearSSL's
+   target-attribute files -- give the address the canary lives at: a 64-byte
+   block in .bss (the dirty data page, so no extra RSS at rest) with the
+   AT_RANDOM secret at +0x28, exactly where the guard looks.
+   aarch64 needs none of this: its gcc defaults to the global guard, which is
+   measured to emit zero TLS-base reads. */
+int fs_set_tls_block(void *base) {
+#if defined(__x86_64__)
+    long r = fs_sys2(FS_SYS_arch_prctl, FS_ARCH_SET_FS, (long)base);
+    if (r < 0) { errno = (int)-r; return -1; }
+    return 0;
+#else
+    (void)base;
+    return 0;
+#endif
+}
+
 /* --- I/O ----------------------------------------------------------------- */
 
 ssize_t read(int fd, void *buf, size_t n) {
@@ -198,12 +228,6 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
     long r = fs_sys(FS_SYS_mmap, (long)addr, (long)len, prot, flags, fd, off);
     if (r < 0) { errno = (int)-r; return MAP_FAILED; }
     return (void *)(uintptr_t)r;
-}
-
-int munmap(void *addr, size_t len) {
-    long r = fs_sys2(FS_SYS_munmap, (long)addr, (long)len);
-    if (r < 0) { errno = (int)-r; return -1; }
-    return 0;
 }
 
 int madvise(void *addr, size_t len, int advice) {

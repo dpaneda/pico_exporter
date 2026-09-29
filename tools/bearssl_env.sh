@@ -78,19 +78,38 @@ build_bearssl_lib() {
   printf '%s' "$BEARSSL_CFLAGS_NO128" > "$out.cflags"
 }
 
-# build_bearssl_lib_lto <out-lib-path> [cc] [ar]: BearSSL for one of the
-# -flto service links. Must be built with the *same* compiler as the final
-# link and with -flto so the link-time optimizer can strip TLS record modes
-# (CBC/CHAPOL/CCM) that the single AEAD suite never uses. A different -flto
-# producer still links, it just re-expands everything. Defaults (with no
+# Per-target extra flags for build_bearssl_lib_lto, set by the callers below.
+BEARSSL_EXTRA=""
+
+# x86_64 only, and not a stylistic choice: gcc 16 miscompiles BearSSL's
+# AES-NI key schedule. br_aes_x86ni_keysched_enc ends up with a movaps to a
+# 16-byte stack slot the prologue never aligned, so the first TLS handshake
+# dies on SIGSEGV. Seen in production on delorean with gcc 16.2.1, and it is
+# not our link's doing: it reproduces on an unmodified HEAD build, with
+# BearSSL compiled without -flto, and the same source links and runs on the
+# aarch64 Pi. The buggy path is selected by the #ifndef-guarded BR_AES_X86NI,
+# so -D0 drops it and the portable br_aes_ct64_bitslice_* is used instead
+# (x86_64-only, and --gc-sections then discards the AES-NI text). BearSSL's
+# intrinsics are the only reason a per-target extra exists at all, so this is
+# where the aarch64/x86_64 difference is allowed to live: the Pi keeps its
+# hardware AES and stays byte-for-byte the link it already runs.
+BEARSSL_EXTRA_HOST="-DBR_AES_X86NI=0"
+
+# build_bearssl_lib_lto <out-lib-path> [cc] [ar] [extra-cflags]: BearSSL for
+# one of the -flto service links. Must be built with the *same* compiler as the
+# final link and with -flto so the link-time optimizer can strip TLS record
+# modes (CBC/CHAPOL/CCM) that the single AEAD suite never uses. A different
+# -flto producer still links, it just re-expands everything. Defaults (with no
 # cc/ar) build the aarch64 deployable lib with $AARCH64_CC /
 # aarch64-linux-gnu-ar.
 build_bearssl_lib_lto() {
   local out="$1"
   local cc="${2:-${AARCH64_CC:-aarch64-linux-gnu-gcc}}"
   local ar="${3:-${AARCH64_AR:-aarch64-linux-gnu-ar}}"
+  local extra="${4:-$BEARSSL_EXTRA}"
+  local flags="$BEARSSL_CFLAGS_NO128 -flto $extra"
   local work
-  bearssl_lib_is_current "$out" "$BEARSSL_CFLAGS_NO128 -flto" && return 0
+  bearssl_lib_is_current "$out" "$flags" && return 0
   rm -f "$out"
   ensure_bearssl_src
   work="$(dirname "$out")/src"
@@ -98,7 +117,7 @@ build_bearssl_lib_lto() {
   [ -d "$work" ] || cp -r "$BEARSSL_SRC" "$work"
   make -C "$work" -j"$(nproc)" clean >/dev/null 2>&1 || :
   make -C "$work" -j"$(nproc)" CC="$cc" AR="$ar" LD="$cc" \
-    CFLAGS="$BEARSSL_CFLAGS_NO128 -flto" build/libbearssl.a >/dev/null
+    CFLAGS="$flags" build/libbearssl.a >/dev/null
   cp "$work/build/libbearssl.a" "$out"
-  printf '%s' "$BEARSSL_CFLAGS_NO128 -flto" > "$out.cflags"
+  printf '%s' "$flags" > "$out.cflags"
 }

@@ -52,7 +52,7 @@ cd "$DIR"
 mk() { make -s "$@" "${MAKEVARS[@]}"; }
 
 echo "== static x86_64 (dev): make =="
-build_bearssl_lib_lto "$BEARSSL_LIB_HOST" "$HOST_CC" ar
+build_bearssl_lib_lto "$BEARSSL_LIB_HOST" "$HOST_CC" ar "$BEARSSL_EXTRA_HOST"
 # The dev binary is entirely the Makefile's job. This runs first so that a
 # GW_URL/CAFILE build has already fetched the bundle and generated the
 # trust-anchor header by the time the aarch64 link needs it.

@@ -494,23 +494,54 @@ rootfs, http; a real host with a bigger arena footprint faults more). Arena
 refaults are the bulk: the kernel's fault-around maps 16 pages per fault, so
 the ~21 text pages and 4 rodata pages come back in about 2-3 faults.
 
-**Pi (aarch64, TLS, live gateway), measured 2026-09-27 after two 60 s
-intervals: `smaps_rollup` Rss 24 kB, Anonymous 20 kB** (`status`: VmRSS 24,
-RssAnon 20, RssFile 4, VmHWM 120 — the HWM is the cycle peak). Per mapping:
-text 4 kB, RW file mapping 4 kB, TLS session mapping 8 kB, stack 8 kB, and no
-`[heap]`. The same process read 28 kB on 2026-09-25 (RssFile 8 kB, RW mapping
-8 kB): the aarch64 first RW page that used to hold `.eh_frame` plus the 4-byte
-writable `.except_unordered` — kept resident by `PCEIL(_pid_base)` — is no
-longer showing up as a second resident page, which is one page of the
-difference; the mechanism was not re-examined, only measured again. Before all
-of this work the same process read 124 kB (92 file + 32 anon).
-Procedure, run after two full intervals (`smaps_rollup` is the figure to
-quote; `status` may lag):
+**Pi (aarch64, TLS, live gateway), re-measured 2026-09-29 after the allocator
+removal and the TLS-canary fix, two 15 s intervals: `smaps_rollup` Rss 24 kB,
+Anonymous 20 kB.** Per mapping: text 4 kB, RW file mapping 4 kB, TLS session
+mapping 8 kB, stack 8 kB, no `[heap]` — unchanged, as expected, since none of
+those changes touch aarch64's code. The x86_64 host moved to **32 kB**, and the
+extra 4 kB is a page-rounding artifact of that link and nothing else: the RW
+segment's `filesz` is 16096 B, which rounds *up* to 4 pages, while `memsz` is
+16440 B, which rounds *up* to 5 — so the kernel maps a fifth page as
+anonymous `.bss` zero-fill, and the process touches it. It is the last 56 bytes
+that do it: the 64-byte `fs_block` (see the canary note in "Conventions &
+gotchas") pushed `memsz` from 16376 to 16440, i.e. across the 4-page boundary.
+Before that the host's `filesz` was 18208 B, already rounding to 5 pages, so
+there was no anon page at all. Chasing it would mean padding `.data` by ~288 B
+to push `filesz` over 16384, which is a hack tuned to a byte-exact coincidence
+that the next `.text` or `.data` edit silently undoes — and it buys nothing on
+the Pi, whose aarch64 layout never hits the boundary. Not done, on purpose.
+
+**The resting figure is 24 **or** 28 kB, and which one you get is settled
+before you measure anything.** Re-measured 2026-09-28 (INTERVAL=15, live
+gateway, new vs previous binary, 4-cycle windows, same host): text 4 kB, RW
+file mapping 4 kB and the anon mapping 8 kB are identical in both binaries and
+across runs — the whole 4 kB difference is the **stack**, 8 kB in one process
+and 12 kB in the next. The mechanism is `idle_stack_floor()`: it is captured
+once, at the first `idle_sleep()`, and everything below it is dropped from then
+on. A cycle that goes one page deeper than the *first* cycle did leaves that
+page resident for the life of the process, so whether a given process settles
+at 24 or 28 kB depends on which path its first cycle took (a first cycle that
+has not yet reused the keep-alive connection is a different path). The 2026-09-25
+28 kB reading is a different, earlier mechanism — an extra RW file page, since
+resolved — so a 28 kB reading is not by itself a regression, and two processes
+can legitimately disagree. The x86_64 host's own baseline is now 32 kB for the
+separate reason in the paragraph above; the Pi, whose layout does not hit that
+boundary, is still 24.
+
+A single `smaps_rollup` read of this process is worth very little on its own.
+Sampled every 0.4 s over 60 s, the same process reads **196 kB** for the ~0.8 s
+of every 15 s cycle it is actually working (text 72 kB, RW 16 kB, anon 92 kB,
+stack 16 kB) and 24-28 kB the rest of the time — 4 cycles in 60 s, each visible
+as two consecutive 196 kB samples. Both numbers are correct: the peak is the
+honest per-cycle cost, the minimum over several samples is the honest resting
+figure. Procedure, run after two full intervals:
 
 ```bash
 P=$(pidof pico_exporter)
-sudo awk '/^(Rss|Anonymous):/{print}' /proc/$P/smaps_rollup
-grep -E "VmRSS|RssAnon|RssFile" /proc/$P/status
+for i in $(seq 30); do
+  sudo awk '/^Rss:/{print $2}' /proc/$P/smaps_rollup
+  sleep 0.4
+done | sort -n | head -1     # resting figure: the MINIMUM, not the last
 ```
 
 | Mapping | RSS at rest | Why it stays |
@@ -650,6 +681,12 @@ suite actually covers:
     report FAIL after having checked every value and passed.
 - **Sink decode** (`verify_batch.py`): totals frames/series; the one-cycle test
   proves `pushed series == dumped samples + up`.
+- **Freestanding TLS gate** (`tests/run.sh`): the real `bin/pico_exporter`, with
+  its real compiled-in trust anchors, against the real public endpoint — one
+  cycle must come back carrying an HTTP status. This exists because the whole
+  TLS suite runs the glibc harness; the freestanding deployable was otherwise
+  only ever driven against the plaintext http sink, which is how two
+  handshake-only faults reached production (see "Conventions & gotchas").
 - TLS cases need network; they `SKIP` cleanly when offline. The python3-based
   sink/push cases `SKIP` when `python3` is absent.
 - **Resting-footprint gate** (`tests/run.sh`, sampled while the process
@@ -713,6 +750,69 @@ in "Memory & footprint" above and update the Pi figure in this file.
   the flag must instead be absent (TEST_CFLAGS filters it): a glibc link has
   no global guard, and `-mstack-protector-guard=global` there is another
   phantom-smash generator.
+- **The canary guard is a per-TU compile decision, so one flag in `CFLAGS` does
+  not cover the whole binary.** This one shipped a SEGV to production on
+  28-Sep-2026: the whole suite was green and the deploy crashed on the first
+  TLS handshake, at `mov %fs:0x28,%r14` in `br_hmac_drbg_update`, because
+  101 canaries in the **BearSSL** objects read a TLS slot that a -nostdlib
+  link never maps. Our TUs get the global guard because they are compiled with
+  the flag; BearSSL is a separate build (`tools/bearssl_env.sh`) that never
+  had it, and the guard is a codegen option that LTO carries per function, so
+  the link-time flag cannot repair it. Two further facts, both measured, both
+  why no compiler flag is the right fix there:
+  - `-mstack-protector-guard=global` fixes ~97 of the 101 sites and **none** of
+    the rest: BearSSL's AES-NI/PCLMUL/RDRAND files set
+    `#define BR_ENABLE_INTRINSICS 1` and wrap their bodies in
+    `#pragma GCC target(...)`, which clones the target-option set and drops the
+    guard back to TLS. Verified by compiling `aes_x86ni_ctr.c` and
+    `ghash_pclmul.c` both ways: 2 `%fs:0x28` references either way.
+  - `-fno-stack-protector` does remove all 101 (and shrinks the binary, −2087 B
+    of `.text`), but it trades a canary fault for a **codegen fault**: with it,
+    gcc 16 LTO emitted `movaps %xmm0,0x30(%rsp)` in
+    `br_aes_x86ni_keysched_enc` against a stack slot the prologue never
+    aligned, and the first handshake died on that instead. Vendored source is
+    not ours to patch either way.
+  The fix is to give the address the canary is read from, rather than to argue
+  with the codegen: `p_main` (which is itself canary-free, see `PMAIN_NOSP`)
+  plants the AT_RANDOM secret at **+0x28 of a 64-byte `.bss` block** and calls
+  `arch_prctl(ARCH_SET_FS=0x1002, block)` via `fs_set_tls_block()` before it
+  ever calls into protected code — set the base first, then fill the slot, so
+  no canary load can catch it zero. The block shares the one dirty data page
+  `idle_sleep` keeps, so this costs **nothing at rest** (RSS gate still 24 kB).
+  aarch64 needs none of it: its gcc defaults to the global guard and measures
+  zero TLS-base reads. The 95 remaining x86_64 TLS canaries are now correct.
+- **gcc 16 miscompiles BearSSL's AES-NI key schedule on x86_64** — the second
+  half of the same outage, and it is *not* our link's doing. Once the canary
+  fault was fixed, the first handshake still SEGV'd, in
+  `br_aes_x86ni_keysched_enc`, on a `movaps` to a stack slot the prologue never
+  aligned. Ruled out as causes, each measured: our source changes (an
+  unmodified HEAD build crashes identically), LTO reaching into BearSSL (a
+  BearSSL built **without** `-flto` crashes too), and the canary flags (it
+  happens with BearSSL at its stock settings). The only variable left was the
+  compiler, and there is exactly one gcc on the host — 16.2.1 — while the
+  binary that shipped and worked was built with an older one. Fix:
+  `BEARSSL_EXTRA_HOST=-DBR_AES_X86NI=0` (x86_64 only) in `tools/bearssl_env.sh`.
+  `BR_AES_X86NI` is `#ifndef`-guarded, so the `-D` drops the intrinsic path for
+  the portable `br_aes_ct64_bitslice_*`, and `--gc-sections` then discards the
+  AES-NI text: **−4.2 kB of `.text`**, so this is smaller, not bigger. What it
+  costs is one software AES per handshake, which is not a per-cycle cost (the
+  connection is held across cycles) and is far below the 13 ms of per-cycle CPU
+  the budget cares about. Note BearSSL has no hardware AES path for aarch64 at
+  all — `symcipher/` has no ARM intrinsics, so the Pi already runs the same
+  portable bitslice implementation, and after this both platforms agree. That
+  is also why only the host lib needed a `-D`: the aarch64 one is unchanged and
+  the two platforms are no longer asymmetric.
+- **The guard rail for both of the above is the `freestanding TLS` case in
+  `tests/run.sh`**, which runs the real deployable — real compiled-in anchors,
+  real endpoint — and requires a cycle back with an HTTP status. The 4xx from
+  bogus credentials is the expected answer; the assertion is that the process
+  survived the handshake to receive one. The old `no TLS-slot canary` gate
+  cannot be kept: those loads are now legitimate, since FS points at a mapped
+  block. The old gate was also structurally unable to catch the second fault.
+  It had to be replaced rather than extended because the real gap was never the
+  static check — it is that **every TLS case in the suite runs the glibc
+  harness**, while the freestanding binary was only ever driven against the
+  plaintext http sink. Nothing ran the production artifact down its TLS path.
 - **Network byte order matters in `s_addr`** — copy the 4 RDATA bytes, do not
   shift-shift-OR.
 - **`idle_sleep` must stay a self-contained page.** No calls out (not even

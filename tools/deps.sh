@@ -9,7 +9,7 @@ DIR="$(cd "$(dirname "$0")/.." && pwd)"
 . "$DIR/tools/bearssl_env.sh"
 
 case "${1:-}" in
-  bearssl-host)   build_bearssl_lib_lto "$BEARSSL_LIB_HOST" "${CC:-cc}" ar ;;
+  bearssl-host)   build_bearssl_lib_lto "$BEARSSL_LIB_HOST" "${CC:-cc}" ar "$BEARSSL_EXTRA_HOST" ;;
   bearssl-aarch64) build_bearssl_lib_lto "$BEARSSL_LIB_AARCH64" ;;
   *) echo "usage: tools/deps.sh <bearssl-host|bearssl-aarch64>" >&2; exit 2 ;;
 esac
