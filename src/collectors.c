@@ -809,8 +809,7 @@ static void collect_network(struct metrics *m) {
     int nifs = 0;
     const char *e;
     while ((e = pdir_next(&d)) != NULL) {
-        if (strcmp(e, ".") == 0 || strcmp(e, "..") == 0 ||
-            strcmp(e, "lo") == 0)
+        if (strcmp(e, ".") == 0 || strcmp(e, "..") == 0)
             continue;
         if ((size_t)nifs >= if_cap) {
             size_t nif_cap = if_cap * 2;

@@ -376,7 +376,7 @@ check "disk writes mmcblk0"       'node_disk_writes_completed_total\{device="mmc
 check "net rx eth0"               'node_network_receive_bytes_total\{device="eth0"\} 1000'
 check "net tx eth0"               'node_network_transmit_bytes_total\{device="eth0"\} 2000'
 check "net rx packets eth0"       'node_network_receive_packets_total\{device="eth0"\} 100'
-refute "loopback excluded"        'device="lo"'
+check "net rx lo"                 'node_network_receive_bytes_total\{device="lo"\} 1000'
 
 # --- pressure absent ---
 refute "pressure absent (no /proc/pressure)" 'node_pressure_'
