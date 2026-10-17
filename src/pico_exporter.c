@@ -168,9 +168,9 @@ static void push_loop(const struct rw_url *u, const char *auth,
     }
 
     struct otlp_kv res[2];
-    res[0].k = "service.name";
+    res[0].k = "job";
     res[0].v = job;
-    res[1].k = "service.instance.id";
+    res[1].k = "instance";
     res[1].v = inst;
 
     struct arena ar;
